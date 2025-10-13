@@ -1,0 +1,1 @@
+# Core module - główna logika biznesowa
