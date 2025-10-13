@@ -1,9 +1,119 @@
-streamlit
-pandas
-numpy
-scikit-learn
-matplotlib
-seaborn
-openai
-pydantic-settings
-reportlab
+# DataGenius PRO - Requirements
+# Python 3.11+
+
+# Core Framework
+streamlit==1.31.0
+streamlit-extras==0.3.6
+
+# Data Science & ML
+pandas==2.2.0
+polars==0.20.6
+numpy==1.26.3
+scikit-learn==1.4.0
+pycaret==3.2.0
+
+# Gradient Boosting
+xgboost==2.0.3
+lightgbm==4.3.0
+catboost==1.2.2
+
+# Deep Learning (optional)
+torch==2.2.0
+tensorflow==2.15.0
+
+# Explainable AI
+shap==0.44.1
+lime==0.2.0.1
+
+# Visualization
+plotly==5.18.0
+matplotlib==3.8.2
+seaborn==0.13.1
+altair==5.2.0
+
+# LLM Integration
+anthropic==0.18.1
+openai==1.12.0
+langchain==0.1.6
+langchain-community==0.0.20
+
+# Database
+sqlalchemy==2.0.25
+alembic==1.13.1
+psycopg2-binary==2.9.9
+redis==5.0.1
+
+# File Handling
+openpyxl==3.1.2
+xlrd==2.0.1
+python-docx==1.1.0
+PyPDF2==3.0.1
+
+# Configuration & Validation
+pydantic==2.6.0
+pydantic-settings==2.1.0
+python-dotenv==1.0.1
+
+# Monitoring & MLOps
+mlflow==2.10.2
+evidently==0.4.13
+prometheus-client==0.19.0
+
+# Report Generation
+reportlab==4.0.9
+jinja2==3.1.3
+weasyprint==60.2
+
+# Data Quality
+great-expectations==0.18.8
+pandera==0.18.0
+
+# API & Web
+fastapi==0.109.0
+uvicorn==0.27.0
+httpx==0.26.0
+requests==2.31.0
+
+# Testing
+pytest==8.0.0
+pytest-cov==4.1.0
+pytest-asyncio==0.23.4
+faker==22.6.0
+
+# Utilities
+tqdm==4.66.1
+python-dateutil==2.8.2
+pytz==2024.1
+joblib==1.3.2
+cloudpickle==3.0.0
+
+# Logging & Monitoring
+loguru==0.7.2
+sentry-sdk==1.40.0
+
+# Code Quality
+black==24.1.1
+flake8==7.0.0
+mypy==1.8.0
+isort==5.13.2
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.5.6
+
+# Deployment
+gunicorn==21.2.0
+supervisor==4.2.5
+
+# Cloud Storage (optional)
+boto3==1.34.34
+google-cloud-storage==2.14.0
+
+# Scheduling
+apscheduler==3.10.4
+celery==5.3.6
+
+# Data Drift Detection
+alibi-detect==0.11.4
+scipy==1.12.0
+statsmodels==0.14.1

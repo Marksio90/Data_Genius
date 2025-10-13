@@ -1,1 +1,213 @@
-__pycache__
+# DataGenius PRO - Git Ignore Rules
+
+# ===========================================
+# Python
+# ===========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ===========================================
+# Virtual Environments
+# ===========================================
+venv/
+env/
+ENV/
+.venv/
+datagenius-pro/
+
+# ===========================================
+# Environment Variables & Secrets
+# ===========================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*credentials.json
+secrets/
+
+# ===========================================
+# IDEs & Editors
+# ===========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+
+# ===========================================
+# Jupyter Notebooks
+# ===========================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===========================================
+# Data Files
+# ===========================================
+data/uploads/*
+!data/uploads/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+*.csv
+*.xlsx
+*.xls
+*.json
+*.parquet
+*.feather
+
+# Exception: keep sample data
+!data/samples/**
+
+# ===========================================
+# Models & Artifacts
+# ===========================================
+models/*
+!models/.gitkeep
+!models/README.md
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# ===========================================
+# MLflow
+# ===========================================
+mlruns/
+mlartifacts/
+
+# ===========================================
+# Reports & Exports
+# ===========================================
+reports/exports/*
+!reports/exports/.gitkeep
+*.pdf
+*.html
+
+# Exception: keep templates
+!reports/templates/**
+
+# ===========================================
+# Logs
+# ===========================================
+logs/*
+!logs/.gitkeep
+*.log
+
+# ===========================================
+# Database
+# ===========================================
+*.db
+*.sqlite
+*.sqlite3
+db/migrations/versions/*
+!db/migrations/versions/.gitkeep
+
+# ===========================================
+# Cache & Temporary Files
+# ===========================================
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+.tox/
+.nox/
+
+# ===========================================
+# Streamlit
+# ===========================================
+.streamlit/secrets.toml
+
+# ===========================================
+# Docker
+# ===========================================
+*.tar
+*.gz
+
+# ===========================================
+# OS Files
+# ===========================================
+Thumbs.db
+Desktop.ini
+
+# ===========================================
+# Backup Files
+# ===========================================
+*.bak
+*.backup
+*~
+
+# ===========================================
+# Compiled Files
+# ===========================================
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# ===========================================
+# Documentation Build
+# ===========================================
+docs/_build/
+site/
+
+# ===========================================
+# Profiling
+# ===========================================
+*.prof
+*.lprof
+
+# ===========================================
+# Testing
+# ===========================================
+.coverage.*
+coverage.xml
+*.cover
+nosetests.xml
+test-results/
+
+# ===========================================
+# CI/CD
+# ===========================================
+.github/workflows/*.local.yml
+
+# ===========================================
+# Monitoring
+# ===========================================
+prometheus_data/
+grafana_data/
+
+# ===========================================
+# Redis
+# ===========================================
+dump.rdb
