@@ -1,14 +1,28 @@
+# === config/model_registry.py ===
 """
-DataGenius PRO - Model Registry Configuration
-Registry of available ML models and their configurations
+DataGenius PRO - Model Registry Configuration (PRO+++)
+Rejestr dostępnych modeli ML oraz strategie doboru per typ problemu.
+
+Zasady:
+- Rejestry są niemutowalne (MappingProxyType).
+- Zgodność wsteczna z istniejącym kodem (nazwy i signatury).
+- Dodane helpery: walidacja strategii, lista strategii, filtrowanie modeli
+  zależnych od zewn. pakietów (xgboost/lightgbm/catboost).
 """
 
-from typing import Dict, List, Any
+from __future__ import annotations
+
 from enum import Enum
+from types import MappingProxyType
+from typing import Dict, List, Any, Mapping, Optional
+import importlib.util
 
 
+# ===========================================
+# === ENUMY ===
+# ===========================================
 class ProblemType(str, Enum):
-    """ML problem types"""
+    """ML problem types."""
     CLASSIFICATION = "classification"
     REGRESSION = "regression"
     CLUSTERING = "clustering"
@@ -16,7 +30,7 @@ class ProblemType(str, Enum):
 
 
 class ModelCategory(str, Enum):
-    """Model categories"""
+    """Model categories."""
     LINEAR = "linear"
     TREE_BASED = "tree_based"
     ENSEMBLE = "ensemble"
@@ -25,8 +39,10 @@ class ModelCategory(str, Enum):
     BOOSTING = "boosting"
 
 
-# Classification Models Registry
-CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
+# ===========================================
+# === REJESTR: KLASYFIKACJA ===
+# ===========================================
+_CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
     "lr": {
         "name": "Logistic Regression",
         "category": ModelCategory.LINEAR,
@@ -107,6 +123,7 @@ CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
         "cons": ["Complex hyperparameters"],
         "best_for": ["Structured data", "Competitions"],
         "turbo": True,
+        "requires": ["xgboost"],
     },
     "lightgbm": {
         "name": "LightGBM",
@@ -116,6 +133,7 @@ CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
         "cons": ["May overfit small data"],
         "best_for": ["Large datasets", "Fast training"],
         "turbo": True,
+        "requires": ["lightgbm"],
     },
     "catboost": {
         "name": "CatBoost",
@@ -125,6 +143,7 @@ CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
         "cons": ["Slower than LightGBM"],
         "best_for": ["Categorical features", "Less tuning needed"],
         "turbo": True,
+        "requires": ["catboost"],
     },
     "ada": {
         "name": "AdaBoost",
@@ -136,10 +155,13 @@ CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
         "turbo": True,
     },
 }
+CLASSIFICATION_MODELS: Mapping[str, Dict[str, Any]] = MappingProxyType(_CLASSIFICATION_MODELS)
 
 
-# Regression Models Registry
-REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
+# ===========================================
+# === REJESTR: REGRESJA ===
+# ===========================================
+_REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
     "lr": {
         "name": "Linear Regression",
         "category": ModelCategory.LINEAR,
@@ -205,7 +227,7 @@ REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "gbr": {
         "name": "Gradient Boosting",
-        "category": ModelCategory.BOOSTING,
+        "category": "ModelCategory.BOOSTING",
         "description": "Sequential ensemble for regression",
         "pros": ["High accuracy", "Flexible"],
         "cons": ["Slow training"],
@@ -220,6 +242,7 @@ REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
         "cons": ["Complex hyperparameters"],
         "best_for": ["Structured data", "Competitions"],
         "turbo": True,
+        "requires": ["xgboost"],
     },
     "lightgbm": {
         "name": "LightGBM",
@@ -229,6 +252,7 @@ REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
         "cons": ["May overfit small data"],
         "best_for": ["Large datasets"],
         "turbo": True,
+        "requires": ["lightgbm"],
     },
     "catboost": {
         "name": "CatBoost",
@@ -238,12 +262,16 @@ REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
         "cons": ["Slower than LightGBM"],
         "best_for": ["Categorical features"],
         "turbo": True,
+        "requires": ["catboost"],
     },
 }
+REGRESSION_MODELS: Mapping[str, Dict[str, Any]] = MappingProxyType(_REGRESSION_MODELS)
 
 
-# Model selection strategies
-MODEL_SELECTION_STRATEGIES = {
+# ===========================================
+# === STRATEGIE WYBORU MODELI ===
+# ===========================================
+_MODEL_SELECTION_STRATEGIES: Dict[str, Dict[str, Any]] = {
     "fast": {
         "description": "Quick models for rapid prototyping",
         "classification": ["lr", "dt", "rf"],
@@ -261,39 +289,104 @@ MODEL_SELECTION_STRATEGIES = {
     },
     "all": {
         "description": "Compare all available models",
-        "classification": list(CLASSIFICATION_MODELS.keys()),
-        "regression": list(REGRESSION_MODELS.keys()),
+        "classification": list(_CLASSIFICATION_MODELS.keys()),
+        "regression": list(_REGRESSION_MODELS.keys()),
     },
 }
+MODEL_SELECTION_STRATEGIES: Mapping[str, Dict[str, Any]] = MappingProxyType(_MODEL_SELECTION_STRATEGIES)
+
+
+# ===========================================
+# === HELPERY ===
+# ===========================================
+def _check_deps(model_id: str, problem_type: ProblemType) -> bool:
+    """
+    Sprawdza, czy wymagane pakiety modelu są dostępne (importowalne).
+    """
+    registry = CLASSIFICATION_MODELS if problem_type == ProblemType.CLASSIFICATION else REGRESSION_MODELS
+    info = registry.get(model_id, {})
+    required = info.get("requires", [])
+    if not required:
+        return True
+    return all(importlib.util.find_spec(pkg) is not None for pkg in required)
+
+
+def list_strategies() -> Dict[str, str]:
+    """Zwraca mapę strategia → opis."""
+    return {k: v["description"] for k, v in MODEL_SELECTION_STRATEGIES.items()}
+
+
+def get_all_model_ids(problem_type: ProblemType) -> List[str]:
+    """Zwraca wszystkie identyfikatory modeli dla danego problemu."""
+    if problem_type == ProblemType.CLASSIFICATION:
+        return list(CLASSIFICATION_MODELS.keys())
+    if problem_type == ProblemType.REGRESSION:
+        return list(REGRESSION_MODELS.keys())
+    raise ValueError(f"Unsupported problem type for registry: {problem_type}")
 
 
 def get_models_for_problem(
     problem_type: ProblemType,
-    strategy: str = "accurate"
+    strategy: str = "accurate",
+    *,
+    only_available: bool = False,
 ) -> List[str]:
     """
-    Get list of model IDs for given problem type and strategy
-    
+    Zwraca listę ID modeli dla danego problemu i strategii.
+
     Args:
-        problem_type: Type of ML problem
-        strategy: Model selection strategy
-    
+        problem_type: Typ problemu ML.
+        strategy: Nazwa strategii (fast/accurate/interpretable/all).
+        only_available: Jeżeli True, odfiltruje modele bez zainstalowanych zależności.
+
     Returns:
-        List of model IDs
+        Lista identyfikatorów modeli.
     """
-    if problem_type == ProblemType.CLASSIFICATION:
-        return MODEL_SELECTION_STRATEGIES[strategy]["classification"]
-    elif problem_type == ProblemType.REGRESSION:
-        return MODEL_SELECTION_STRATEGIES[strategy]["regression"]
-    else:
+    if strategy not in MODEL_SELECTION_STRATEGIES:
+        raise ValueError(f"Unknown strategy '{strategy}'. Available: {', '.join(MODEL_SELECTION_STRATEGIES.keys())}")
+
+    key = "classification" if problem_type == ProblemType.CLASSIFICATION else \
+          "regression" if problem_type == ProblemType.REGRESSION else None
+
+    if key is None:
         raise ValueError(f"Unsupported problem type: {problem_type}")
+
+    models = list(MODEL_SELECTION_STRATEGIES[strategy][key])
+
+    if only_available:
+        models = [m for m in models if _check_deps(m, problem_type)]
+    return models
 
 
 def get_model_info(model_id: str, problem_type: ProblemType) -> Dict[str, Any]:
-    """Get detailed information about a model"""
+    """
+    Zwraca szczegóły modelu dla danego ID i typu problemu.
+    """
     if problem_type == ProblemType.CLASSIFICATION:
-        return CLASSIFICATION_MODELS.get(model_id, {})
-    elif problem_type == ProblemType.REGRESSION:
-        return REGRESSION_MODELS.get(model_id, {})
-    else:
-        return {}
+        return dict(CLASSIFICATION_MODELS.get(model_id, {}))
+    if problem_type == ProblemType.REGRESSION:
+        return dict(REGRESSION_MODELS.get(model_id, {}))
+    return {}
+
+
+def is_model_supported(model_id: str, problem_type: ProblemType) -> bool:
+    """
+    Czy model istnieje w rejestrze (nie sprawdza zależności)?
+    """
+    registry = CLASSIFICATION_MODELS if problem_type == ProblemType.CLASSIFICATION else \
+               REGRESSION_MODELS if problem_type == ProblemType.REGRESSION else {}
+    return model_id in registry
+
+
+__all__ = [
+    "ProblemType",
+    "ModelCategory",
+    "CLASSIFICATION_MODELS",
+    "REGRESSION_MODELS",
+    "MODEL_SELECTION_STRATEGIES",
+    "get_models_for_problem",
+    "get_model_info",
+    "list_strategies",
+    "get_all_model_ids",
+    "is_model_supported",
+]
