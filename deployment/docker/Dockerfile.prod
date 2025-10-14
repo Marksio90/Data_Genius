@@ -1,0 +1,73 @@
+# Dockerfile.prod
+# Multi-stage image for production (API and UI targets)
+# Usage examples:
+#   API: docker build -f Dockerfile.prod --target api -t datagenius-api .
+#   UI : docker build -f Dockerfile.prod --target ui  -t datagenius-ui  .
+
+############################
+# Base image with deps
+############################
+FROM python:3.10-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PYTHONPATH=/app \
+    MPLCONFIGDIR=/tmp/mpl
+
+# System deps (build tools, postgres, weasyprint libs, plotting)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential gcc g++ \
+    libpq-dev \
+    curl git \
+    libgomp1 \
+    libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libffi-dev libssl-dev \
+    libgl1 libglib2.0-0 \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps first for better layer caching
+# Make sure you have a requirements.txt at repo root
+COPY requirements.txt ./requirements.txt
+RUN python -m pip install --upgrade pip \
+ && pip install -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create non-root user
+RUN adduser --disabled-password --gecos "" appuser \
+ && chown -R appuser:appuser /app /tmp /var
+USER appuser
+
+############################
+# API target (FastAPI / Uvicorn)
+############################
+FROM base AS api
+
+ENV ENVIRONMENT=production \
+    LOG_LEVEL=INFO \
+    UVICORN_HOST=0.0.0.0 \
+    UVICORN_PORT=8000
+
+EXPOSE 8000
+
+# Adjust module path below if your FastAPI entrypoint differs
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+
+############################
+# UI target (Streamlit)
+############################
+FROM base AS ui
+
+ENV ENVIRONMENT=production \
+    LOG_LEVEL=INFO \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_HEADLESS=true
+
+EXPOSE 8501
+
+# Adjust app path below if your Streamlit entrypoint differs
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

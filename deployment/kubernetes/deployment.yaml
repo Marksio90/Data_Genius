@@ -1,0 +1,396 @@
+# deployment.yaml
+# Kubernetes manifests for DataGenius PRO (API + UI)
+# - Namespace
+# - ConfigMap + Secrets
+# - Persistent Volumes (PVCs)
+# - Deployments (+ liveness/readiness probes)
+# - Services
+# - Ingress (single host, path-based)
+# - Horizontal Pod Autoscalers (HPAs)
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: datagenius
+  labels:
+    app: datagenius
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datagenius-config
+  namespace: datagenius
+data:
+  # ===== App & Runtime =====
+  APP_NAME: "DataGenius PRO"
+  APP_VERSION: "2.0.0"
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  DEBUG: "false"
+  TIMEZONE: "Europe/Warsaw"
+
+  # ===== API =====
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  API_WORKERS: "4"
+  API_RELOAD: "false"
+
+  # ===== ML / PyCaret =====
+  PYCARET_SESSION_ID: "42"
+  PYCARET_N_JOBS: "-1"
+  PYCARET_FOLD: "5"
+  PYCARET_VERBOSE: "false"
+  ENABLE_HYPERPARAMETER_TUNING: "true"
+  MAX_TRAINING_TIME_MINUTES: "30"
+
+  # ===== Feature Flags =====
+  ENABLE_AI_MENTOR: "true"
+  ENABLE_AUTO_EDA: "true"
+  ENABLE_AUTO_ML: "true"
+  ENABLE_REPORTS: "true"
+  ENABLE_REGISTRY: "true"
+  ENABLE_DEEP_LEARNING: "false"
+  ENABLE_MULTI_USER: "false"
+
+  # ===== Monitoring =====
+  ENABLE_MONITORING: "true"
+  MONITORING_SCHEDULE: "weekly"
+  DRIFT_DETECTION_THRESHOLD: "0.05"
+  ENABLE_ALERTS: "true"
+
+  # ===== Observability (optional) =====
+  ENABLE_MLFLOW_LOGGING: "false"
+  MLFLOW_TRACKING_URI: "http://mlflow.datagenius.local:5000"
+  MLFLOW_EXPERIMENT_NAME: "datagenius-pro"
+
+  ENABLE_WANDB_LOGGING: "false"
+  WANDB_PROJECT: "datagenius-pro"
+
+  ENABLE_PROMETHEUS: "false"
+  PROMETHEUS_PORT: "9090"
+
+  DEFAULT_LANGUAGE: "pl"
+
+  # ===== UI =====
+  STREAMLIT_SERVER_PORT: "8501"
+  STREAMLIT_SERVER_HEADLESS: "true"
+  # Point UI to API service (same cluster)
+  DATAGENIUS_API_BASE_URL: "http://datagenius-api.datagenius.svc.cluster.local:8000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: datagenius-secrets
+  namespace: datagenius
+type: Opaque
+stringData:
+  # ===== DB (used by settings.get_database_url when not SQLite) =====
+  DB_HOST: "postgres"               # set to your Postgres service name/DNS
+  DB_PORT: "5432"
+  DB_NAME: "datagenius_pro"
+  DB_USER: "datagenius"
+  DB_PASSWORD: "change-me"
+
+  # Alternatively you can set DATABASE_URL directly (overrides discrete fields)
+  # DATABASE_URL: "postgresql://datagenius:change-me@postgres:5432/datagenius_pro"
+
+  # ===== Redis =====
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  REDIS_PASSWORD: ""
+
+  # ===== LLM keys (optional) =====
+  ANTHROPIC_API_KEY: ""
+  OPENAI_API_KEY: ""
+  DEFAULT_LLM_PROVIDER: "anthropic"  # or "openai"
+
+  # ===== Security =====
+  SECRET_KEY: "change-me-in-production"
+  JWT_SECRET_KEY: "change-me-in-production"
+  JWT_ALGORITHM: "HS256"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+
+  # ===== Alerts (optional) =====
+  ALERT_EMAIL: ""
+  ALERT_SLACK_WEBHOOK: ""
+
+  # ===== Sentry (optional) =====
+  SENTRY_DSN: ""
+---
+# Persistent storage for models, reports, logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: datagenius-models-pvc
+  namespace: datagenius
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: datagenius-reports-pvc
+  namespace: datagenius
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: datagenius-logs-pvc
+  namespace: datagenius
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datagenius-api
+  namespace: datagenius
+  labels:
+    app: datagenius
+    tier: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: datagenius
+      tier: api
+  template:
+    metadata:
+      labels:
+        app: datagenius
+        tier: api
+    spec:
+      containers:
+        - name: api
+          # Replace with your registry/image:tag
+          image: ghcr.io/your-org/datagenius-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: datagenius-config
+            - secretRef:
+                name: datagenius-secrets
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+            - name: reports
+              mountPath: /app/reports/exports
+            - name: logs
+              mountPath: /app/logs
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: datagenius-models-pvc
+        - name: reports
+          persistentVolumeClaim:
+            claimName: datagenius-reports-pvc
+        - name: logs
+          persistentVolumeClaim:
+            claimName: datagenius-logs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datagenius-api
+  namespace: datagenius
+  labels:
+    app: datagenius
+    tier: api
+spec:
+  selector:
+    app: datagenius
+    tier: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datagenius-ui
+  namespace: datagenius
+  labels:
+    app: datagenius
+    tier: ui
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: datagenius
+      tier: ui
+  template:
+    metadata:
+      labels:
+        app: datagenius
+        tier: ui
+    spec:
+      containers:
+        - name: ui
+          # Replace with your registry/image:tag
+          image: ghcr.io/your-org/datagenius-ui:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+              name: http
+          envFrom:
+            - configMapRef:
+                name: datagenius-config
+            - secretRef:
+                name: datagenius-secrets
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datagenius-ui
+  namespace: datagenius
+  labels:
+    app: datagenius
+    tier: ui
+spec:
+  selector:
+    app: datagenius
+    tier: ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8501
+  type: ClusterIP
+---
+# Single-host ingress with path-based routing:
+# - /api -> API service
+# - /    -> UI (Streamlit) service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datagenius-ingress
+  namespace: datagenius
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/rewrite-target: /$1
+spec:
+  tls:
+    - hosts:
+        - datagenius.example.com
+      secretName: datagenius-tls # Create this secret with your cert or use cert-manager
+  rules:
+    - host: datagenius.example.com
+      http:
+        paths:
+          - path: /api/?(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: datagenius-api
+                port:
+                  number: 8000
+          - path: /(.*)
+            pathType: Prefix
+            backend:
+              service:
+                name: datagenius-ui
+                port:
+                  number: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: datagenius-api-hpa
+  namespace: datagenius
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: datagenius-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: datagenius-ui-hpa
+  namespace: datagenius
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: datagenius-ui
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

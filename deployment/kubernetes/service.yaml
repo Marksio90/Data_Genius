@@ -1,0 +1,41 @@
+# service.yaml
+# ClusterIP Services for DataGenius PRO (API + UI)
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: datagenius-api
+  namespace: datagenius
+  labels:
+    app: datagenius
+    component: api
+spec:
+  type: ClusterIP
+  selector:
+    app: datagenius
+    component: api
+  ports:
+    - name: http
+      port: 8000         # Service port exposed inside the cluster
+      targetPort: 8000   # FastAPI container port
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datagenius-ui
+  namespace: datagenius
+  labels:
+    app: datagenius
+    component: ui
+spec:
+  type: ClusterIP
+  selector:
+    app: datagenius
+    component: ui
+  ports:
+    - name: http
+      port: 80           # Routed by Ingress
+      targetPort: 8501   # Streamlit default container port
+      protocol: TCP

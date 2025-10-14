@@ -1,0 +1,228 @@
+version: "3.9"
+
+# DataGenius PRO — production docker-compose
+# - FastAPI API backend
+# - Streamlit UI
+# - Postgres + Redis
+# - MLflow tracking
+# - Nginx reverse proxy (serves UI at / and API at /api)
+#
+# Wymagania:
+# - plik .env z kluczami i konfiguracją (patrz sekcja environment)
+# - Dockerfile'e (docker/Dockerfile.api i docker/Dockerfile.ui) lub dostosuj build.path
+# - Konfiguracja Nginx w docker/nginx/conf.d/default.conf (przykład w repo)
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: dg-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-datagenius_pro}
+      POSTGRES_USER: ${DB_USER:-datagenius}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # automatyczna inicjalizacja schematu przy pierwszym starcie
+      - ./db/sql:/docker-entrypoint-initdb.d:ro
+    networks:
+      - datagenius
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-datagenius} -d ${DB_NAME:-datagenius_pro} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: dg-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - datagenius
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: dg-mlflow
+    restart: unless-stopped
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlruns
+    volumes:
+      - mlflow_data:/mlruns
+      - mlflow_db:/app
+    networks:
+      - datagenius
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: dg-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # środowisko produkcyjne
+      ENVIRONMENT: production
+      DEBUG: "False"
+      LOG_LEVEL: INFO
+
+      # DB — możesz też użyć DB_* jeśli korzystasz z settings.get_database_url()
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${DB_USER:-datagenius}:${DB_PASSWORD:-password}@db:5432/${DB_NAME:-datagenius_pro}}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-datagenius_pro}
+      DB_USER: ${DB_USER:-datagenius}
+      DB_PASSWORD: ${DB_PASSWORD:-password}
+
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+
+      # MLflow
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      ENABLE_MLFLOW_LOGGING: ${ENABLE_MLFLOW_LOGGING:-False}
+
+      # Ogólne
+      APP_NAME: "DataGenius PRO"
+      APP_VERSION: ${APP_VERSION:-2.0.0}
+      PYCARET_N_JOBS: -1
+      PYCARET_FOLD: 5
+      PYCARET_VERBOSE: "False"
+      ENABLE_MONITORING: ${ENABLE_MONITORING:-True}
+      MONITORING_SCHEDULE: ${MONITORING_SCHEDULE:-weekly}
+
+      # LLM (sekrety w .env)
+      DEFAULT_LLM_PROVIDER: ${DEFAULT_LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    networks:
+      - datagenius
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    volumes:
+      # trwałe artefakty i dane
+      - uploads:/app/data/uploads
+      - processed:/app/data/processed
+      - models:/app/models
+      - reports:/app/reports/exports
+      - logs:/app/logs
+    expose:
+      - "8000"
+    # Dostosuj ścieżkę aplikacji FastAPI (module:app)
+    command: >
+      uvicorn api.main:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --forwarded-allow-ips="*"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    container_name: dg-ui
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "False"
+      LOG_LEVEL: INFO
+      # UI łączy się do API po sieci dockerowej
+      API_BASE_URL: http://api:8000
+      # te same ścieżki/volumeny co backend (współdzielone wyniki, raporty)
+      APP_NAME: "DataGenius PRO"
+    networks:
+      - datagenius
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - uploads:/app/data/uploads
+      - processed:/app/data/processed
+      - models:/app/models
+      - reports:/app/reports/exports
+      - logs:/app/logs
+    expose:
+      - "8501"
+    # Dostosuj główny plik aplikacji Streamlit
+    command: >
+      streamlit run app.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      --server.headless true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8501/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: dg-nginx
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+      ui:
+        condition: service_started
+    ports:
+      - "80:80"
+      # - "443:443"   # odkomentuj po dodaniu certyfikatów
+    volumes:
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      # - ./docker/nginx/certs:/etc/nginx/certs:ro  # dla HTTPS
+      - nginx_logs:/var/log/nginx
+    networks:
+      - datagenius
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+# ===== VOLUMES =====
+volumes:
+  pg_data:
+  redis_data:
+  mlflow_data:
+  mlflow_db:
+  uploads:
+  processed:
+  models:
+  reports:
+  logs:
+  nginx_logs:
+
+# ===== NETWORKS =====
+networks:
+  datagenius:
+    driver: bridge

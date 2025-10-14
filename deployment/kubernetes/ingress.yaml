@@ -1,0 +1,50 @@
+# ingress.yaml
+# NGINX Ingress for DataGenius PRO (UI + API on one host, path-based routing)
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datagenius-ingress
+  namespace: datagenius
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    # Allow large file uploads (CSV/Excel)
+    nginx.ingress.kubernetes.io/proxy-body-size: "200m"
+
+    # Keep connections alive, and allow long-running requests (model training)
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "64"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+    # Enforce HTTPS (if your controller terminates TLS)
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+    # Streamlit uses websockets
+    nginx.ingress.kubernetes.io/websocket-services: "datagenius-ui"
+spec:
+  tls:
+    - hosts:
+        - datagenius.example.com
+      secretName: datagenius-tls   # create this secret or use cert-manager
+  rules:
+    - host: datagenius.example.com
+      http:
+        paths:
+          # Route API requests to FastAPI service
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: datagenius-api
+                port:
+                  number: 8000
+
+          # Route everything else to the Streamlit UI
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: datagenius-ui
+                port:
+                  number: 80
