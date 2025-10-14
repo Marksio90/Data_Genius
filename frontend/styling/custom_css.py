@@ -1,352 +1,233 @@
 """
-DataGenius PRO - Custom CSS
-Custom styling for Streamlit application
+DataGenius PRO - Custom CSS (PRO+++)
+Centralne stylowanie + lekkie komponenty HTML dla Streamlit.
 """
 
+from __future__ import annotations
+from typing import Optional, Dict
+import json
 import streamlit as st
 
 
-# Custom CSS styles
-CUSTOM_CSS = """
+# === NAZWA_SEKCJI === CSS bazowy (namespaced + zmienne + tryby) ===
+_BASE_CSS = r"""
 <style>
-    /* Main container */
-    .main {
-        padding: 2rem;
+  /* ========= DataGenius Namespace ========= */
+  :root {
+    --dg-primary: #667eea;
+    --dg-primary-2: #764ba2;
+    --dg-text-1: #1f2937;
+    --dg-text-2: #4b5563;
+    --dg-muted: #6b7280;
+    --dg-bg-1: #ffffff;
+    --dg-bg-2: #f8f9fa;
+    --dg-border: #e5e7eb;
+    --dg-ok: #16a34a;
+    --dg-warn: #f59e0b;
+    --dg-danger: #ef4444;
+    --dg-info: #0ea5e9;
+    --dg-chip-bg-ok: #15a34a1a;
+    --dg-chip-bg-warn: #f59e0b1a;
+    --dg-radius: 12px;
+    --dg-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    --dg-spacing: 1.5rem; /* zmniejsz w compact */
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --dg-text-1: #e5e7eb;
+      --dg-text-2: #cbd5e1;
+      --dg-muted: #94a3b8;
+      --dg-bg-1: #0b1220;
+      --dg-bg-2: #111827;
+      --dg-border: #1f2937;
+      --dg-shadow: 0 2px 12px rgba(0,0,0,0.45);
     }
-    
-    /* Headers */
-    h1 {
-        color: #1f77b4;
-        font-weight: 700;
-        margin-bottom: 1rem;
-    }
-    
-    h2 {
-        color: #2c3e50;
-        font-weight: 600;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-    }
-    
-    h3 {
-        color: #34495e;
-        font-weight: 500;
-    }
-    
-    /* Metric cards */
-    [data-testid="stMetricValue"] {
-        font-size: 2rem;
-        font-weight: 700;
-    }
-    
-    [data-testid="stMetricLabel"] {
-        font-size: 1rem;
-        font-weight: 500;
-    }
-    
-    /* Buttons */
-    .stButton > button {
-        border-radius: 8px;
-        font-weight: 600;
-        transition: all 0.3s ease;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    }
-    
-    /* Primary button */
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border: none;
-    }
-    
-    /* Success/Error messages */
-    .element-container .stAlert {
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 1rem 0;
-    }
-    
-    /* DataFrames */
-    [data-testid="stDataFrame"] {
-        border-radius: 8px;
-        overflow: hidden;
-    }
-    
-    /* Sidebar */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
-    }
-    
-    /* Sidebar content */
-    [data-testid="stSidebar"] .stMarkdown {
-        padding: 0.5rem 0;
-    }
-    
-    /* Expander */
-    .streamlit-expanderHeader {
-        font-weight: 600;
-        font-size: 1.1rem;
-        border-radius: 8px;
-    }
-    
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px 8px 0 0;
-        padding: 12px 24px;
-        font-weight: 600;
-    }
-    
-    /* File uploader */
-    [data-testid="stFileUploader"] {
-        border: 2px dashed #ccc;
-        border-radius: 8px;
-        padding: 2rem;
-        text-align: center;
-        transition: all 0.3s ease;
-    }
-    
-    [data-testid="stFileUploader"]:hover {
-        border-color: #667eea;
-        background-color: #f8f9ff;
-    }
-    
-    /* Progress bar */
-    .stProgress > div > div > div > div {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-    }
-    
-    /* Spinner */
-    .stSpinner > div {
-        border-top-color: #667eea !important;
-    }
-    
-    /* Code blocks */
-    code {
-        background-color: #f4f4f4;
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
-    }
-    
-    /* Info boxes */
-    .info-box {
-        background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
-        border-left: 4px solid #2196f3;
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 1rem 0;
-    }
-    
-    .warning-box {
-        background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
-        border-left: 4px solid #ff9800;
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 1rem 0;
-    }
-    
-    .success-box {
-        background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
-        border-left: 4px solid #4caf50;
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 1rem 0;
-    }
-    
-    .error-box {
-        background: linear-gradient(135deg, #ffebee 0%, #ffcdd2 100%);
-        border-left: 4px solid #f44336;
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 1rem 0;
-    }
-    
-    /* Cards */
-    .metric-card {
-        background: white;
-        border-radius: 12px;
-        padding: 1.5rem;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-        transition: all 0.3s ease;
-    }
-    
-    .metric-card:hover {
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
-        transform: translateY(-4px);
-    }
-    
-    /* Plotly charts */
-    .js-plotly-plot {
-        border-radius: 8px;
-        overflow: hidden;
-    }
-    
-    /* Footer */
-    footer {
-        visibility: hidden;
-    }
-    
-    footer:after {
-        content: 'DataGenius PRO v2.0 | Built with ❤️';
-        visibility: visible;
-        display: block;
-        text-align: center;
-        padding: 1rem;
-        color: #666;
-    }
-    
-    /* Scrollbar */
-    ::-webkit-scrollbar {
-        width: 10px;
-        height: 10px;
-    }
-    
-    ::-webkit-scrollbar-track {
-        background: #f1f1f1;
-        border-radius: 10px;
-    }
-    
-    ::-webkit-scrollbar-thumb {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 10px;
-    }
-    
-    ::-webkit-scrollbar-thumb:hover {
-        background: #667eea;
-    }
-    
-    /* Animations */
-    @keyframes fadeIn {
-        from {
-            opacity: 0;
-            transform: translateY(20px);
-        }
-        to {
-            opacity: 1;
-            transform: translateY(0);
-        }
-    }
-    
-    .animate-fade-in {
-        animation: fadeIn 0.5s ease-out;
-    }
-    
-    /* Responsive adjustments */
-    @media (max-width: 768px) {
-        .main {
-            padding: 1rem;
-        }
-        
-        h1 {
-            font-size: 1.5rem;
-        }
-        
-        h2 {
-            font-size: 1.25rem;
-        }
-    }
-    
-    /* Hide Streamlit branding */
-    #MainMenu {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* Custom badge */
-    .badge {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 12px;
-        font-size: 0.875rem;
-        font-weight: 600;
-        margin: 0 4px;
-    }
-    
-    .badge-success {
-        background-color: #d4edda;
-        color: #155724;
-    }
-    
-    .badge-warning {
-        background-color: #fff3cd;
-        color: #856404;
-    }
-    
-    .badge-danger {
-        background-color: #f8d7da;
-        color: #721c24;
-    }
-    
-    .badge-info {
-        background-color: #d1ecf1;
-        color: #0c5460;
-    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .dg-animate { animation: none !important; transition: none !important; }
+  }
+
+  /* ========= Layout / Typography ========= */
+  .main { padding: var(--dg-spacing); }
+  h1, h2, h3 { color: var(--dg-text-1); }
+  h1 { font-weight: 800; margin-bottom: .75rem; }
+  h2 { font-weight: 700; margin: 1.25rem 0 .75rem; }
+  h3 { font-weight: 600; margin: 1rem 0 .5rem; }
+
+  /* ========= Cards / Containers ========= */
+  .dg-card {
+    background: var(--dg-bg-1);
+    border-radius: var(--dg-radius);
+    box-shadow: var(--dg-shadow);
+    padding: 1.25rem 1.25rem;
+    border: 1px solid var(--dg-border);
+  }
+  .dg-card:hover { transform: translateY(-2px); transition: transform .2s ease; }
+
+  /* ========= Metric card ========= */
+  .dg-metric {
+    display: grid; grid-template-columns: 56px 1fr; gap: .75rem; align-items: start;
+  }
+  .dg-metric .dg-icon { font-size: 2rem; line-height: 2rem; }
+  .dg-metric .dg-title { font-size: .9rem; color: var(--dg-muted); font-weight: 600; }
+  .dg-metric .dg-value { font-size: 2rem; font-weight: 800; color: var(--dg-primary); }
+  .dg-metric .dg-sub { font-size: .85rem; color: var(--dg-text-2); }
+
+  /* ========= Badges / Chips ========= */
+  .dg-badge {
+    display:inline-block; padding: 4px 10px; border-radius: 999px;
+    font-size:.825rem; font-weight: 700; margin: 0 4px 4px 0;
+    border: 1px solid var(--dg-border); background: var(--dg-bg-2); color: var(--dg-text-1);
+  }
+  .dg-badge.success { background:#d4edda; color:#155724; border-color:#c3e6cb; }
+  .dg-badge.warning { background:#fff3cd; color:#856404; border-color:#ffeeba; }
+  .dg-badge.danger  { background:#f8d7da; color:#721c24; border-color:#f5c6cb; }
+  .dg-badge.info    { background:#d1ecf1; color:#0c5460; border-color:#bee5eb; }
+
+  .dg-chip {
+    display:inline-block; padding: 2px 10px; border-radius:999px; font-size:.8rem; font-weight:700;
+    border:1px solid var(--dg-ok); color: var(--dg-ok); background: var(--dg-chip-bg-ok);
+  }
+  .dg-chip.warn { border-color: var(--dg-warn); color: var(--dg-warn); background: var(--dg-chip-bg-warn); }
+
+  /* ========= Info boxes ========= */
+  .dg-info, .dg-warn, .dg-success, .dg-error {
+    border-left: 4px solid; padding: 1rem; border-radius: var(--dg-radius);
+    margin: .75rem 0; background: var(--dg-bg-2);
+  }
+  .dg-info    { border-color: var(--dg-info); }
+  .dg-warn    { border-color: var(--dg-warn); }
+  .dg-success { border-color: var(--dg-ok); }
+  .dg-error   { border-color: var(--dg-danger); }
+
+  /* ========= Buttons (pill) ========= */
+  .dg-pill {
+    display:inline-flex; align-items:center; gap:.5rem; padding:.6rem 1rem; border-radius:999px;
+    border:1px solid var(--dg-border); background: var(--dg-bg-1); color: var(--dg-text-1);
+    font-weight:700; cursor:pointer; text-decoration:none;
+    transition:transform .15s ease, box-shadow .15s ease;
+    box-shadow: var(--dg-shadow);
+  }
+  .dg-pill:hover { transform: translateY(-1px); }
+  .dg-pill.primary { background: linear-gradient(135deg, var(--dg-primary) 0%, var(--dg-primary-2) 100%); color: #fff; border: none; }
+
+  /* ========= Tabs / Tables / Uploader / Progress / Spinner ========= */
+  .stTabs [data-baseweb="tab"] { border-radius: 10px 10px 0 0; font-weight:700; }
+  [data-testid="stDataFrame"] { border-radius: var(--dg-radius); overflow:hidden; }
+  [data-testid="stFileUploader"] {
+      border: 2px dashed var(--dg-border); border-radius: var(--dg-radius); padding: 2rem; text-align:center;
+  }
+  [data-testid="stFileUploader"]:hover {
+      border-color: var(--dg-primary); background-color: rgba(102,126,234,0.05);
+  }
+  .stProgress > div > div > div > div {
+      background: linear-gradient(90deg, var(--dg-primary) 0%, var(--dg-primary-2) 100%);
+  }
+  .stSpinner > div { border-top-color: var(--dg-primary) !important; }
+
+  /* ========= Code / Plotly ========= */
+  code { background: #0a0a0a0d; padding: 2px 6px; border-radius:4px; }
+  .js-plotly-plot { border-radius: var(--dg-radius); overflow:hidden; }
+
+  /* ========= Hide Streamlit marks (opcjonalnie) ========= */
+  #MainMenu, header { visibility: hidden; }
+
+  /* ========= Animations ========= */
+  @keyframes dg-fade-in {
+    from { opacity:0; transform: translateY(8px); }
+    to   { opacity:1; transform: translateY(0); }
+  }
+  .dg-animate { animation: dg-fade-in .35s ease-out; }
+
+  /* ========= Responsive ========= */
+  @media (max-width: 768px) {
+    .main { padding: calc(var(--dg-spacing) * .66); }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.25rem; }
+  }
 </style>
 """
 
 
-def load_custom_css():
-    """Load custom CSS into Streamlit app"""
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+# === NAZWA_SEKCJI === API: wstrzyknięcie CSS z override i trybem compact ===
+def load_custom_css(theme_overrides: Optional[Dict[str, str]] = None, compact: bool = False) -> None:
+    """
+    Wstrzykuj CSS do aplikacji.
+    - theme_overrides: np. {"--dg-primary": "#0ea5e9", "--dg-radius": "10px"}
+    - compact: True → mniejsze paddingi (gęstszy UI)
+    """
+    st.markdown(_BASE_CSS, unsafe_allow_html=True)
+
+    overrides = theme_overrides or {}
+    if compact:
+        overrides["--dg-spacing"] = "1rem"
+
+    if overrides:
+        # generujemy :root z nadpisaniami
+        css_vars = "\n".join([f"  {k}: {v};" for k, v in overrides.items() if k.startswith("--dg-")])
+        st.markdown(f"<style>:root {{\n{css_vars}\n}}</style>", unsafe_allow_html=True)
 
 
-def render_metric_card(title: str, value: str, subtitle: str = "", icon: str = ""):
-    """
-    Render custom metric card
-    
-    Args:
-        title: Card title
-        value: Main value
-        subtitle: Subtitle text
-        icon: Icon emoji
-    """
-    
-    st.markdown(f"""
-    <div class="metric-card animate-fade-in">
-        <div style="font-size: 2rem; margin-bottom: 0.5rem;">{icon}</div>
-        <div style="font-size: 0.875rem; color: #666; font-weight: 600; margin-bottom: 0.5rem;">
-            {title}
+# === NAZWA_SEKCJI === Komponenty: metric card / badge / info box / status chip / section header / pill button ===
+def render_metric_card(title: str, value: str, subtitle: str = "", icon: str = "") -> None:
+    """Karta metryki (lekka, a11y)."""
+    st.markdown(
+        f"""
+        <div class="dg-card dg-animate">
+          <div class="dg-metric">
+            <div class="dg-icon">{icon or ''}</div>
+            <div>
+              <div class="dg-title">{title}</div>
+              <div class="dg-value">{value}</div>
+              <div class="dg-sub">{subtitle}</div>
+            </div>
+          </div>
         </div>
-        <div style="font-size: 2rem; font-weight: 700; color: #1f77b4; margin-bottom: 0.5rem;">
-            {value}
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_badge(text: str, type: str = "info") -> None:
+    """Prosta odznaka: info | success | warning | danger."""
+    type = (type or "info").lower()
+    st.markdown(f'<span class="dg-badge {type}">{text}</span>', unsafe_allow_html=True)
+
+def render_info_box(content: str, type: str = "info") -> None:
+    """Box informacyjny: info | warning | success | error."""
+    mapping = {"info":"dg-info","warning":"dg-warn","success":"dg-success","error":"dg-error"}
+    cls = mapping.get(type.lower(), "dg-info")
+    st.markdown(f'<div class="{cls} dg-animate">{content}</div>', unsafe_allow_html=True)
+
+def render_status_chip(online: bool, label_ok: str = "AI: ONLINE", label_off: str = "AI: OFFLINE") -> None:
+    """Mini „chip” statusu (np. AI ONLINE/OFFLINE)."""
+    if online:
+        html = f'<span class="dg-chip">{label_ok}</span>'
+    else:
+        html = f'<span class="dg-chip warn">{label_off}</span>'
+    st.markdown(f'<div style="text-align:right">{html}</div>', unsafe_allow_html=True)
+
+def section_header(title: str, subtitle: str = "") -> None:
+    """Nagłówek sekcji z cieniem."""
+    st.markdown(
+        f"""
+        <div class="dg-animate" style="margin:.5rem 0 1rem;">
+          <h2 style="margin:.25rem 0">{title}</h2>
+          <div style="color:var(--dg-text-2)">{subtitle}</div>
         </div>
-        <div style="font-size: 0.875rem; color: #999;">
-            {subtitle}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-
-def render_badge(text: str, type: str = "info"):
+def pill_button(text: str, href: Optional[str] = None, primary: bool = False, right: bool = False) -> None:
     """
-    Render badge
-    
-    Args:
-        text: Badge text
-        type: Badge type (success, warning, danger, info)
+    Przyciski w formie pigułki (linki). Użyteczne do skrótów/nawigacji.
+    - href: jeśli podasz, renderuje <a>; jeśli None — zwykły span (dekoracyjny).
+    - primary: wypełniony gradientem.
+    - right: wyrównanie do prawej.
     """
-    
-    st.markdown(f"""
-    <span class="badge badge-{type}">{text}</span>
-    """, unsafe_allow_html=True)
-
-
-def render_info_box(content: str, type: str = "info"):
-    """
-    Render styled info box
-    
-    Args:
-        content: Box content
-        type: Box type (info, warning, success, error)
-    """
-    
-    st.markdown(f"""
-    <div class="{type}-box animate-fade-in">
-        {content}
-    </div>
-    """, unsafe_allow_html=True)
+    cls = "dg-pill primary" if primary else "dg-pill"
+    wrap = 'style="display:flex; justify-content:flex-end; margin:.25rem 0;"' if right else ""
+    inner = f'<a class="{cls}" href="{href}" target="_self">{text}</a>' if href else f'<span class="{cls}">{text}</span>'
+    st.markdown(f'<div {wrap}>{inner}</div>', unsafe_allow_html=True)
