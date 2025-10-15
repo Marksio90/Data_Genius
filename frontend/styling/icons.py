@@ -80,8 +80,9 @@ _SVG: Dict[str, SvgIcon] = {
     "eda": SvgIcon(
         "0 0 24 24",
         paths=[
-            "M11 11a8 8 0 1 0 0-16 8 8 0 0 0 0 16z",  # „szkło” (okrąg)
-            "M21 21l-4.35-4.35",  # rączka lupy
+            # prosta i czytelna lupa: okrąg + rączka
+            '<circle cx="11" cy="11" r="8" />',
+            '<line x1="21" y1="21" x2="16.65" y2="16.65" />',
         ],
     ),
     "ai": SvgIcon(
@@ -235,14 +236,23 @@ def _paths_to_svg_content(icon: SvgIcon, stroke: float) -> str:
         f'stroke-width="{stroke}" stroke-linecap="{icon.stroke_linecap}" stroke-linejoin="{icon.stroke_linejoin}"'
     ), inner
 
+
 @st.cache_data(show_spinner=False)
-def get_svg(name: str, size: int = 20, color: str = "currentColor", stroke: float = 2.0, aria_label: Optional[str] = None) -> str:
+def get_svg(
+    name: str,
+    size: int = 20,
+    color: str = "currentColor",
+    stroke: float = 2.0,
+    aria_label: Optional[str] = None,
+    title: Optional[str] = None,
+) -> str:
     """
     Zwraca **string SVG** (inline) dla zadanej ikony.
     - size: rozmiar w px (szerokość/wysokość).
     - color: CSS (np. 'currentColor', '#0ea5e9').
     - stroke: grubość linii.
     - aria_label: tekst a11y, gdy podany doda role="img" i aria-label.
+    - title: opcjonalny <title> jako tooltip i wsparcie a11y.
     """
     key = name.lower().strip()
     icon = _SVG.get(key)
@@ -250,24 +260,36 @@ def get_svg(name: str, size: int = 20, color: str = "currentColor", stroke: floa
         # fallback do emoji jako SVG-tekst
         emoji = get_emoji(key, default="🔹")
         return f'<span aria-hidden="true" style="font-size:{size}px;line-height:1">{emoji}</span>'
+
     attrs, inner = _paths_to_svg_content(icon, stroke)
     aria = f' role="img" aria-label="{html.escape(aria_label)}"' if aria_label else ' aria-hidden="true"'
-    return f'<svg {attrs} width="{size}" height="{size}" style="color:{color}"{aria}>\n    {inner}\n</svg>'
+    title_tag = f"<title>{html.escape(title)}</title>" if title else ""
+    return f'<svg {attrs} width="{size}" height="{size}" style="color:{color}"{aria}>{title_tag}{inner}</svg>'
 
-def render_svg(name: str, size: int = 20, color: str = "currentColor", stroke: float = 2.0, aria_label: Optional[str] = None, align: str = "center") -> None:
+
+def render_svg(
+    name: str,
+    size: int = 20,
+    color: str = "currentColor",
+    stroke: float = 2.0,
+    aria_label: Optional[str] = None,
+    align: str = "center",
+    title: Optional[str] = None,
+) -> None:
     """
     Renderuje ikonę SVG w komponencie Markdown.
     - align: left | center | right — justowanie bloku.
     """
     align_css = {"left": "flex-start", "center": "center", "right": "flex-end"}.get(align, "center")
-    html_block = f'<div style="display:flex;justify-content:{align_css}">{get_svg(name, size, color, stroke, aria_label)}</div>'
+    html_block = f'<div style="display:flex;justify-content:{align_css}">{get_svg(name, size, color, stroke, aria_label, title)}</div>'
     st.markdown(html_block, unsafe_allow_html=True)
+
 
 def icon_label(name: str, label: str, size: int = 18, color: str = "currentColor", gap_px: int = 8) -> str:
     """
     Zwraca gotowy HTML, który możesz osadzić w `st.markdown`: [SVG] [label].
     """
-    svg = get_svg(name, size=size, color=color)
+    svg = get_svg(name, size=size, color=color, title=label, aria_label=label)
     return f'<span style="display:inline-flex;align-items:center;gap:{gap_px}px">{svg}<span>{html.escape(label)}</span></span>'
 
 
@@ -284,3 +306,36 @@ def list_icons(kind: str = "all") -> List[str]:
     if k == "svg":
         return sorted(_SVG.keys())
     return sorted(set(_EMOJI.keys()) | set(_SVG.keys()))
+
+
+def get_icon_html(
+    name: str,
+    label: Optional[str] = None,
+    size: int = 18,
+    color: str = "currentColor",
+    stroke: float = 2.0,
+) -> str:
+    """
+    Zwraca HTML ikony (SVG lub emoji fallback).
+    - Jeśli `name` istnieje w _SVG → zwróci SVG z aria-label=label oraz <title>.
+    - W przeciwnym razie zwróci emoji (aria-hidden).
+    """
+    if name.lower().strip() in _SVG:
+        return get_svg(name, size=size, color=color, stroke=stroke, aria_label=label, title=label)
+    emoji = get_emoji(name)
+    return f'<span aria-hidden="true" style="font-size:{size}px;line-height:1">{emoji}</span>'
+
+
+def icon_with_text(
+    name: str,
+    text: str,
+    size: int = 18,
+    color: str = "currentColor",
+    gap_px: int = 8,
+    stroke: float = 2.0,
+) -> str:
+    """
+    Zwraca HTML: [ikona] [tekst], z pełnym fallbackiem i a11y.
+    """
+    icon_html = get_icon_html(name, label=text, size=size, color=color, stroke=stroke)
+    return f'<span style="display:inline-flex;align-items:center;gap:{gap_px}px">{icon_html}<span>{html.escape(text)}</span></span>'

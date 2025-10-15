@@ -1,15 +1,38 @@
 """
 DataGenius PRO - Custom CSS (PRO+++)
 Centralne stylowanie + lekkie komponenty HTML dla Streamlit.
+
+Ten moduł:
+- wstrzykuje spójny CSS z możliwością nadpisania zmiennych (CSS variables)
+- zapewnia „compact mode”
+- pozwala opcjonalnie ukryć branding Streamlit
+- renderuje lekkie komponenty (metric card, badge, info box, status chip, header, pill button)
+- dba o jednokrotne wstrzyknięcie CSS na sesję
+
+Użycie:
+    from ui.custom_css import load_custom_css, render_metric_card, render_badge, ...
+
+    load_custom_css(
+        theme_overrides={"--dg-primary": "#0ea5e9", "--dg-radius": "10px"},
+        compact=True,
+        hide_streamlit_branding=True,
+    )
+
+    render_metric_card("Dokładność", "0.913", "5-fold CV", "📈")
 """
 
 from __future__ import annotations
+
 from typing import Optional, Dict
-import json
+import html
 import streamlit as st
 
+# Klucz sesyjny — aby nie duplikować stylów przy rerenderze
+_DG_CSS_FLAG = "__dg_css_loaded_v2"
 
-# === NAZWA_SEKCJI === CSS bazowy (namespaced + zmienne + tryby) ===
+# =========================
+# CSS bazowy (namespaced)
+# =========================
 _BASE_CSS = r"""
 <style>
   /* ========= DataGenius Namespace ========= */
@@ -131,9 +154,6 @@ _BASE_CSS = r"""
   code { background: #0a0a0a0d; padding: 2px 6px; border-radius:4px; }
   .js-plotly-plot { border-radius: var(--dg-radius); overflow:hidden; }
 
-  /* ========= Hide Streamlit marks (opcjonalnie) ========= */
-  #MainMenu, header { visibility: hidden; }
-
   /* ========= Animations ========= */
   @keyframes dg-fade-in {
     from { opacity:0; transform: translateY(8px); }
@@ -151,37 +171,58 @@ _BASE_CSS = r"""
 """
 
 
-# === NAZWA_SEKCJI === API: wstrzyknięcie CSS z override i trybem compact ===
-def load_custom_css(theme_overrides: Optional[Dict[str, str]] = None, compact: bool = False) -> None:
+# =========================
+# API: wstrzyknięcie CSS
+# =========================
+def load_custom_css(
+    theme_overrides: Optional[Dict[str, str]] = None,
+    compact: bool = False,
+    hide_streamlit_branding: bool = True,
+) -> None:
     """
-    Wstrzykuj CSS do aplikacji.
-    - theme_overrides: np. {"--dg-primary": "#0ea5e9", "--dg-radius": "10px"}
-    - compact: True → mniejsze paddingi (gęstszy UI)
-    """
-    st.markdown(_BASE_CSS, unsafe_allow_html=True)
+    Wstrzykuj CSS do aplikacji Streamlit (jednorazowo na sesję).
 
-    overrides = theme_overrides or {}
+    :param theme_overrides: np. {"--dg-primary": "#0ea5e9", "--dg-radius": "10px"}
+    :param compact: True → mniejsze paddingi (gęstszy UI)
+    :param hide_streamlit_branding: ukryj MainMenu i nagłówek Streamlit
+    """
+    if not st.session_state.get(_DG_CSS_FLAG):
+        st.markdown(_BASE_CSS, unsafe_allow_html=True)
+        st.session_state[_DG_CSS_FLAG] = True
+
+    overrides = dict(theme_overrides or {})
     if compact:
         overrides["--dg-spacing"] = "1rem"
 
     if overrides:
-        # generujemy :root z nadpisaniami
-        css_vars = "\n".join([f"  {k}: {v};" for k, v in overrides.items() if k.startswith("--dg-")])
+        css_vars = "\n".join(
+            [f"  {k}: {v};" for k, v in overrides.items() if k.startswith("--dg-")]
+        )
         st.markdown(f"<style>:root {{\n{css_vars}\n}}</style>", unsafe_allow_html=True)
 
+    if hide_streamlit_branding:
+        st.markdown("<style>#MainMenu, header {visibility:hidden;}</style>", unsafe_allow_html=True)
 
-# === NAZWA_SEKCJI === Komponenty: metric card / badge / info box / status chip / section header / pill button ===
+
+# =========================
+# Komponenty HTML
+# =========================
+def _escape(s: str) -> str:
+    """Proste escapowanie, aby uniknąć wstrzyknięć HTML w tekstach."""
+    return html.escape(s or "")
+
+
 def render_metric_card(title: str, value: str, subtitle: str = "", icon: str = "") -> None:
     """Karta metryki (lekka, a11y)."""
     st.markdown(
         f"""
-        <div class="dg-card dg-animate">
+        <div class="dg-card dg-animate" role="group" aria-label="{_escape(title)} metric">
           <div class="dg-metric">
-            <div class="dg-icon">{icon or ''}</div>
+            <div class="dg-icon" aria-hidden="true">{_escape(icon)}</div>
             <div>
-              <div class="dg-title">{title}</div>
-              <div class="dg-value">{value}</div>
-              <div class="dg-sub">{subtitle}</div>
+              <div class="dg-title">{_escape(title)}</div>
+              <div class="dg-value">{_escape(value)}</div>
+              <div class="dg-sub">{_escape(subtitle)}</div>
             </div>
           </div>
         </div>
@@ -189,36 +230,42 @@ def render_metric_card(title: str, value: str, subtitle: str = "", icon: str = "
         unsafe_allow_html=True,
     )
 
+
 def render_badge(text: str, type: str = "info") -> None:
     """Prosta odznaka: info | success | warning | danger."""
     type = (type or "info").lower()
-    st.markdown(f'<span class="dg-badge {type}">{text}</span>', unsafe_allow_html=True)
+    st.markdown(f'<span class="dg-badge {type}">{_escape(text)}</span>', unsafe_allow_html=True)
+
 
 def render_info_box(content: str, type: str = "info") -> None:
     """Box informacyjny: info | warning | success | error."""
-    mapping = {"info":"dg-info","warning":"dg-warn","success":"dg-success","error":"dg-error"}
+    mapping = {"info": "dg-info", "warning": "dg-warn", "success": "dg-success", "error": "dg-error"}
     cls = mapping.get(type.lower(), "dg-info")
     st.markdown(f'<div class="{cls} dg-animate">{content}</div>', unsafe_allow_html=True)
 
+
 def render_status_chip(online: bool, label_ok: str = "AI: ONLINE", label_off: str = "AI: OFFLINE") -> None:
     """Mini „chip” statusu (np. AI ONLINE/OFFLINE)."""
-    if online:
-        html = f'<span class="dg-chip">{label_ok}</span>'
-    else:
-        html = f'<span class="dg-chip warn">{label_off}</span>'
-    st.markdown(f'<div style="text-align:right">{html}</div>', unsafe_allow_html=True)
+    html_chip = (
+        f'<span class="dg-chip">{_escape(label_ok)}</span>'
+        if online
+        else f'<span class="dg-chip warn">{_escape(label_off)}</span>'
+    )
+    st.markdown(f'<div style="text-align:right">{html_chip}</div>', unsafe_allow_html=True)
+
 
 def section_header(title: str, subtitle: str = "") -> None:
     """Nagłówek sekcji z cieniem."""
     st.markdown(
         f"""
         <div class="dg-animate" style="margin:.5rem 0 1rem;">
-          <h2 style="margin:.25rem 0">{title}</h2>
-          <div style="color:var(--dg-text-2)">{subtitle}</div>
+          <h2 style="margin:.25rem 0">{_escape(title)}</h2>
+          <div style="color:var(--dg-text-2)">{_escape(subtitle)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
 
 def pill_button(text: str, href: Optional[str] = None, primary: bool = False, right: bool = False) -> None:
     """
@@ -229,5 +276,5 @@ def pill_button(text: str, href: Optional[str] = None, primary: bool = False, ri
     """
     cls = "dg-pill primary" if primary else "dg-pill"
     wrap = 'style="display:flex; justify-content:flex-end; margin:.25rem 0;"' if right else ""
-    inner = f'<a class="{cls}" href="{href}" target="_self">{text}</a>' if href else f'<span class="{cls}">{text}</span>'
+    inner = f'<a class="{cls}" href="{_escape(href or "#")}" target="_self">{_escape(text)}</a>' if href else f'<span class="{cls}">{_escape(text)}</span>'
     st.markdown(f'<div {wrap}>{inner}</div>', unsafe_allow_html=True)
