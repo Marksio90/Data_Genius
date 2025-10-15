@@ -1,12 +1,12 @@
 # === config/constants.py ===
 """
-DataGenius PRO - Application Constants (PRO+++)
-Centralny, niemutowalny zestaw stałych dla aplikacji: UI, EDA, ML, monitoring, raporty.
+DataGenius PRO - Application Constants (PRO++++++)
+Centralny, niemutowalny zestaw stałych: UI, EDA, ML, monitoring, raporty.
 
 Zasady:
-- Zero pobocznych efektów, brak I/O oraz importów do settings (brak cykli).
-- Mapy opakowane w MappingProxyType (niemutowalność runtime).
-- Zgodność wsteczna: zachowane główne nazwy (DATE_FEATURES, COLOR_PALETTE_PRIMARY, itp.).
+- Zero pobocznych efektów (brak I/O),
+- Mapy opakowane w MappingProxyType (niemutowalność w runtime),
+- Zgodność z modułami PRO+++ (FeatureEngineer, routes, schemas).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Dict, List, Mapping, Optional, Tuple, Literal
 
-# Typowy alias na problem ML, spójny z resztą kodu (bez importu ProblemType)
+# Typowy alias na problem ML (bez importu z innych modułów)
 ProblemKind = Literal["classification", "regression"]
 
 # ===========================================
@@ -33,6 +33,7 @@ APP_DESCRIPTION: str = (
 # ===========================================
 SUPPORTED_FILE_EXTENSIONS: List[str] = [
     ".csv",
+    ".tsv",
     ".xlsx",
     ".xls",
     ".json",
@@ -41,26 +42,37 @@ SUPPORTED_FILE_EXTENSIONS: List[str] = [
 
 FILE_TYPE_DESCRIPTIONS: Mapping[str, str] = MappingProxyType({
     ".csv": "CSV (Comma-Separated Values)",
+    ".tsv": "TSV (Tab-Separated Values)",
     ".xlsx": "Excel (XLSX)",
     ".xls": "Excel (XLS - Legacy)",
     ".json": "JSON (JavaScript Object Notation)",
     ".parquet": "Parquet (Columnar Format)",
 })
 
+def _normalize_ext(s: str) -> str:
+    s = s.strip().lower()
+    # jeśli to sama nazwa rozszerzenia, np. "csv" → ".csv"
+    if "." not in s:
+        return f".{s}"
+    # jeśli to pełna ścieżka/nazwa pliku → weź ostatnią kropkę
+    if not s.startswith("."):
+        s = "." + s.split(".")[-1]
+    return s
+
 def is_supported_extension(filename_or_ext: str) -> bool:
-    """
-    Sprawdza, czy podane rozszerzenie/plik jest wspierane.
-    """
-    ext = (filename_or_ext.lower() if filename_or_ext.startswith(".")
-           else "." + filename_or_ext.split(".")[-1].lower())
+    """Sprawdza, czy rozszerzenie/plik jest wspierane (bezpiecznie)."""
+    try:
+        ext = _normalize_ext(filename_or_ext)
+    except Exception:
+        return False
     return ext in SUPPORTED_FILE_EXTENSIONS
 
 def describe_extension(filename_or_ext: str) -> Optional[str]:
-    """
-    Zwraca opis rozszerzenia (lub None).
-    """
-    ext = (filename_or_ext.lower() if filename_or_ext.startswith(".")
-           else "." + filename_or_ext.split(".")[-1].lower())
+    """Zwraca opis rozszerzenia (albo None)."""
+    try:
+        ext = _normalize_ext(filename_or_ext)
+    except Exception:
+        return None
     return FILE_TYPE_DESCRIPTIONS.get(ext)
 
 # ===========================================
@@ -75,14 +87,17 @@ OUTLIER_METHODS: List[str] = ["iqr", "zscore", "isolation_forest"]
 # ===========================================
 # === FEATURE ENGINEERING ===
 # ===========================================
+# UWAGA: to są WZORCE NAZW kolumn datowych używane przez FeatureEngineer.do detekcji,
+# a nie nazwy cech wyjściowych (rok/miesiąc itd.)
 DATE_FEATURES: List[str] = [
-    "year",
-    "month",
-    "day",
-    "dayofweek",
-    "dayofyear",
-    "quarter",
-    "is_weekend",
+    "date",
+    "datetime",
+    "timestamp",
+    "ts",
+    "created",
+    "updated",
+    "time",
+    "event_time",
 ]
 
 TEXT_FEATURES: List[str] = [
@@ -92,14 +107,12 @@ TEXT_FEATURES: List[str] = [
 ]
 
 # ===========================================
-# === ML TRAINING (UWAGA: wartości runtime są w settings) ===
+# === ML TRAINING (domyślne/wyświetlanie) ===
 # ===========================================
-# Wartości „domyślne” jako stałe — docelowe parametry i tak kontrolujesz w config.settings.
-# Pozostawiamy dla kompatybilności z ewentualnym użyciem w UI/tooltipach.
 DEFAULT_TEST_SIZE: float = 0.2
 DEFAULT_CV_FOLDS: int = 5
 RANDOM_SEED: int = 42
-DEFAULT_TUNING_ITERATIONS: int = 10  # preferowane: settings.DEFAULT_TUNING_ITERATIONS
+DEFAULT_TUNING_ITERATIONS: int = 10
 
 # ===========================================
 # === METRYKI ===
@@ -122,9 +135,7 @@ REGRESSION_METRICS: Mapping[str, str] = MappingProxyType({
 })
 
 def get_metric_label(metric: str, problem_type: ProblemKind) -> Optional[str]:
-    """
-    Zwraca label metryki dla danego problemu ML.
-    """
+    """Zwraca label metryki dla danego problemu ML."""
     m = CLASSIFICATION_METRICS if problem_type == "classification" else REGRESSION_METRICS
     return m.get(metric)
 
@@ -205,15 +216,16 @@ REPORT_SECTIONS: List[str] = [
     "recommendations",
 ]
 
-REPORT_FORMATS: List[str] = ["pdf", "html", "docx"]
+# Align z schemas.ReportFormatEnum ("html","pdf","markdown")
+REPORT_FORMATS: List[str] = ["pdf", "html", "markdown"]
 
 # ===========================================
 # === MONITORING ===
 # ===========================================
 DRIFT_THRESHOLDS: Mapping[str, float] = MappingProxyType({
     "psi": 0.1,   # Population Stability Index
-    "ks": 0.05,   # Kolmogorov-Smirnov
-    "js": 0.1,    # Jensen-Shannon
+    "ks": 0.05,   # Kolmogorov-Smirnov (p-value threshold – interpretacyjne)
+    "js": 0.1,    # Jensen-Shannon (jeśli używany)
 })
 
 PERFORMANCE_THRESHOLD: float = 0.05  # 5% drop
@@ -317,20 +329,52 @@ SAMPLE_DATASETS: Mapping[str, Dict] = MappingProxyType({
 })
 
 # ===========================================
-# === API (opcjonalnie FastAPI) ===
+# === API (FastAPI) — zgrane z backend/api/routes.py ===
 # ===========================================
 API_ENDPOINTS: Mapping[str, str] = MappingProxyType({
-    "health": "/health",
-    "predict": "/api/v1/predict",
-    "train": "/api/v1/train",
-    "explain": "/api/v1/explain",
+    "health": "/api/health",
+    "data_preview": "/api/v1/data/preview",
+    "data_upload_csv": "/api/v1/data/upload_csv",
+    "schema_analyze": "/api/v1/schema/analyze",
+    "profile": "/api/v1/profile",
+    "problem_classify": "/api/v1/problem/classify",
+    "target_detect": "/api/v1/target/detect",
+    "eda_run": "/api/v1/eda/run",
+    "eda_report": "/api/v1/eda/report",
+    "pipeline_build": "/api/v1/pipeline/build",
+    "ml_run": "/api/v1/ml/run",
 })
 
 # ===========================================
 # === CACHE ===
 # ===========================================
 CACHE_TTL: Mapping[str, int] = MappingProxyType({
-    "eda_results": 3600,        # 1 hour
-    "model_predictions": 1800,  # 30 minutes
-    "llm_responses": 7200,      # 2 hours
+    "eda_results": 3600,        # 1h
+    "model_predictions": 1800,  # 30 min
+    "llm_responses": 7200,      # 2h
 })
+
+# ===========================================
+# === __all__ ===
+# ===========================================
+__all__ = [
+    "ProblemKind",
+    "APP_TITLE", "APP_SUBTITLE", "APP_ICON", "APP_DESCRIPTION",
+    "SUPPORTED_FILE_EXTENSIONS", "FILE_TYPE_DESCRIPTIONS",
+    "is_supported_extension", "describe_extension",
+    "MAX_PREVIEW_ROWS", "MIN_ROWS_FOR_ML", "MAX_CATEGORICAL_UNIQUE_VALUES",
+    "MISSING_DATA_THRESHOLD", "OUTLIER_METHODS",
+    "DATE_FEATURES", "TEXT_FEATURES",
+    "DEFAULT_TEST_SIZE", "DEFAULT_CV_FOLDS", "RANDOM_SEED", "DEFAULT_TUNING_ITERATIONS",
+    "CLASSIFICATION_METRICS", "REGRESSION_METRICS", "get_metric_label",
+    "COLOR_PALETTE_PRIMARY", "COLOR_PALETTE_CATEGORICAL", "CHART_TYPES", "is_supported_chart",
+    "AI_MENTOR_SYSTEM_PROMPT", "AI_MENTOR_STARTERS",
+    "REPORT_SECTIONS", "REPORT_FORMATS",
+    "DRIFT_THRESHOLDS", "PERFORMANCE_THRESHOLD", "MONITORING_FREQUENCIES",
+    "SESSION_STATUS", "PIPELINE_STAGES",
+    "ERROR_MESSAGES", "SUCCESS_MESSAGES",
+    "PAGE_ICONS", "STATUS_COLORS",
+    "SAMPLE_DATASETS",
+    "API_ENDPOINTS",
+    "CACHE_TTL",
+]

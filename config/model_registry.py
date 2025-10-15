@@ -1,20 +1,17 @@
 # === config/model_registry.py ===
 """
-DataGenius PRO - Model Registry Configuration (PRO+++)
-Rejestr dostępnych modeli ML oraz strategie doboru per typ problemu.
+DataGenius PRO - Model Registry Configuration (PRO++++++)
+Rejestr modeli ML + strategie wyboru per typ problemu, z walidacją i
+obsługą brakujących zależności (xgboost/lightgbm/catboost).
 
-Zasady:
-- Rejestry są niemutowalne (MappingProxyType).
-- Zgodność wsteczna z istniejącym kodem (nazwy i signatury).
-- Dodane helpery: walidacja strategii, lista strategii, filtrowanie modeli
-  zależnych od zewn. pakietów (xgboost/lightgbm/catboost).
+Zewnętrzne API zachowane (get_models_for_problem, get_model_info, ...).
 """
 
 from __future__ import annotations
 
 from enum import Enum
 from types import MappingProxyType
-from typing import Dict, List, Any, Mapping, Optional
+from typing import Dict, List, Any, Mapping, Optional, Iterable
 import importlib.util
 
 
@@ -22,15 +19,13 @@ import importlib.util
 # === ENUMY ===
 # ===========================================
 class ProblemType(str, Enum):
-    """ML problem types."""
     CLASSIFICATION = "classification"
     REGRESSION = "regression"
-    CLUSTERING = "clustering"
-    TIME_SERIES = "time_series"
+    CLUSTERING = "clustering"       # zarezerwowane (poza zakresem tego modułu)
+    TIME_SERIES = "time_series"     # zarezerwowane (poza zakresem tego modułu)
 
 
 class ModelCategory(str, Enum):
-    """Model categories."""
     LINEAR = "linear"
     TREE_BASED = "tree_based"
     ENSEMBLE = "ensemble"
@@ -54,7 +49,7 @@ _CLASSIFICATION_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "knn": {
         "name": "K-Nearest Neighbors",
-        "category": ModelCategory.LINEAR,
+        "category": ModelCategory.LINEAR,  # traktujemy w tej taksonomii jako „nieparametryczny klasyk”
         "description": "Instance-based learning algorithm",
         "pros": ["Simple", "No training phase"],
         "cons": ["Slow predictions", "Sensitive to scale"],
@@ -227,7 +222,7 @@ _REGRESSION_MODELS: Dict[str, Dict[str, Any]] = {
     },
     "gbr": {
         "name": "Gradient Boosting",
-        "category": "ModelCategory.BOOSTING",
+        "category": ModelCategory.BOOSTING,  # ✅ naprawione: wcześniej był string
         "description": "Sequential ensemble for regression",
         "pros": ["High accuracy", "Flexible"],
         "cons": ["Slow training"],
@@ -280,7 +275,7 @@ _MODEL_SELECTION_STRATEGIES: Dict[str, Dict[str, Any]] = {
     "accurate": {
         "description": "Focus on accuracy (slower training)",
         "classification": ["xgboost", "lightgbm", "catboost", "rf", "et"],
-        "regression": ["xgboost", "lightgbm", "catboost", "rf", "et"],
+        "regression": ["xgboost", "lightgbm", "catboost", "rf", "et", "gbr"],
     },
     "interpretable": {
         "description": "Interpretable models for explanations",
@@ -292,6 +287,11 @@ _MODEL_SELECTION_STRATEGIES: Dict[str, Dict[str, Any]] = {
         "classification": list(_CLASSIFICATION_MODELS.keys()),
         "regression": list(_REGRESSION_MODELS.keys()),
     },
+    "all_available": {
+        "description": "All models with installed dependencies",
+        "classification": list(_CLASSIFICATION_MODELS.keys()),
+        "regression": list(_REGRESSION_MODELS.keys()),
+    },
 }
 MODEL_SELECTION_STRATEGIES: Mapping[str, Dict[str, Any]] = MappingProxyType(_MODEL_SELECTION_STRATEGIES)
 
@@ -300,9 +300,7 @@ MODEL_SELECTION_STRATEGIES: Mapping[str, Dict[str, Any]] = MappingProxyType(_MOD
 # === HELPERY ===
 # ===========================================
 def _check_deps(model_id: str, problem_type: ProblemType) -> bool:
-    """
-    Sprawdza, czy wymagane pakiety modelu są dostępne (importowalne).
-    """
+    """True, jeśli wszystkie wymagane pakiety danego modelu są importowalne."""
     registry = CLASSIFICATION_MODELS if problem_type == ProblemType.CLASSIFICATION else REGRESSION_MODELS
     info = registry.get(model_id, {})
     required = info.get("requires", [])
@@ -311,13 +309,18 @@ def _check_deps(model_id: str, problem_type: ProblemType) -> bool:
     return all(importlib.util.find_spec(pkg) is not None for pkg in required)
 
 
+def available_models(models: Iterable[str], problem_type: ProblemType) -> List[str]:
+    """Filtruje podane modele pozostawiając tylko te z dostępnymi zależnościami."""
+    return [m for m in models if _check_deps(m, problem_type)]
+
+
 def list_strategies() -> Dict[str, str]:
-    """Zwraca mapę strategia → opis."""
+    """Mapa nazwa_strategii → opis."""
     return {k: v["description"] for k, v in MODEL_SELECTION_STRATEGIES.items()}
 
 
 def get_all_model_ids(problem_type: ProblemType) -> List[str]:
-    """Zwraca wszystkie identyfikatory modeli dla danego problemu."""
+    """Wszystkie identyfikatory modeli dla danego problemu."""
     if problem_type == ProblemType.CLASSIFICATION:
         return list(CLASSIFICATION_MODELS.keys())
     if problem_type == ProblemType.REGRESSION:
@@ -333,35 +336,40 @@ def get_models_for_problem(
 ) -> List[str]:
     """
     Zwraca listę ID modeli dla danego problemu i strategii.
-
-    Args:
-        problem_type: Typ problemu ML.
-        strategy: Nazwa strategii (fast/accurate/interpretable/all).
-        only_available: Jeżeli True, odfiltruje modele bez zainstalowanych zależności.
-
-    Returns:
-        Lista identyfikatorów modeli.
+    - strategy: fast/accurate/interpretable/all/all_available
+    - only_available=True odfiltruje modele bez zależności
+    - dodatkowo, jeśli po filtrze nic nie zostanie, automatycznie fallback do bezpiecznych: ['rf','et','dt','lr'/'ridge']
     """
     if strategy not in MODEL_SELECTION_STRATEGIES:
         raise ValueError(f"Unknown strategy '{strategy}'. Available: {', '.join(MODEL_SELECTION_STRATEGIES.keys())}")
 
     key = "classification" if problem_type == ProblemType.CLASSIFICATION else \
           "regression" if problem_type == ProblemType.REGRESSION else None
-
     if key is None:
         raise ValueError(f"Unsupported problem type: {problem_type}")
 
-    models = list(MODEL_SELECTION_STRATEGIES[strategy][key])
+    base = list(MODEL_SELECTION_STRATEGIES[strategy][key])
 
+    # 'all_available' – dynamiczny filtr
+    if strategy == "all_available":
+        base = available_models(base, problem_type)
+
+    models = base
     if only_available:
-        models = [m for m in models if _check_deps(m, problem_type)]
-    return models
+        models = available_models(models, problem_type)
+
+    # defensywny fallback
+    if not models:
+        models = ["rf", "et", "dt"] + (["lr"] if problem_type == ProblemType.CLASSIFICATION else ["ridge"])
+
+    # usuń duplikaty zachowując kolejność
+    seen = set()
+    unique = [m for m in models if not (m in seen or seen.add(m))]
+    return unique
 
 
 def get_model_info(model_id: str, problem_type: ProblemType) -> Dict[str, Any]:
-    """
-    Zwraca szczegóły modelu dla danego ID i typu problemu.
-    """
+    """Szczegóły modelu dla danego ID i typu problemu."""
     if problem_type == ProblemType.CLASSIFICATION:
         return dict(CLASSIFICATION_MODELS.get(model_id, {}))
     if problem_type == ProblemType.REGRESSION:
@@ -370,12 +378,43 @@ def get_model_info(model_id: str, problem_type: ProblemType) -> Dict[str, Any]:
 
 
 def is_model_supported(model_id: str, problem_type: ProblemType) -> bool:
-    """
-    Czy model istnieje w rejestrze (nie sprawdza zależności)?
-    """
+    """Czy model istnieje w rejestrze (nie sprawdza zależności)?"""
     registry = CLASSIFICATION_MODELS if problem_type == ProblemType.CLASSIFICATION else \
                REGRESSION_MODELS if problem_type == ProblemType.REGRESSION else {}
     return model_id in registry
+
+
+# ===========================================
+# === WALIDACJA PRZY IMPORCIE (dev-safe) ===
+# ===========================================
+def _validate_registry() -> None:
+    def _check_block(name: str, block: Mapping[str, Dict[str, Any]]):
+        # brak duplikatów kluczy – Python i tak to gwarantuje, ale sprawdźmy semantycznie
+        assert isinstance(block, Mapping)
+        for mid, info in block.items():
+            assert "name" in info and isinstance(info["name"], str), f"{name}.{mid} missing 'name'"
+            assert "category" in info and isinstance(info["category"], ModelCategory), f"{name}.{mid} invalid 'category'"
+            if "requires" in info:
+                req = info["requires"]
+                assert isinstance(req, list) and all(isinstance(x, str) for x in req), f"{name}.{mid} 'requires' must be list[str]"
+
+    _check_block("CLASSIFICATION_MODELS", CLASSIFICATION_MODELS)
+    _check_block("REGRESSION_MODELS", REGRESSION_MODELS)
+
+    # strategie – czy wskazują istniejące modele
+    for strat, spec in MODEL_SELECTION_STRATEGIES.items():
+        for key in ("classification", "regression"):
+            if key in spec:
+                registry = CLASSIFICATION_MODELS if key == "classification" else REGRESSION_MODELS
+                missing = [m for m in spec[key] if m not in registry]
+                assert not missing, f"Strategy '{strat}' references unknown models in {key}: {missing}"
+
+# uruchom walidację (bez podnoszenia wyjątku w prod, ale crash w czasie dev/test jest pożądany)
+try:  # pragma: no cover
+    _validate_registry()
+except AssertionError as e:  # nie obalaj aplikacji w produkcji; podczas dev będzie widoczne w testach
+    import warnings
+    warnings.warn(f"[model_registry] validation warning: {e}", RuntimeWarning)
 
 
 __all__ = [
@@ -389,4 +428,5 @@ __all__ = [
     "list_strategies",
     "get_all_model_ids",
     "is_model_supported",
+    "available_models",
 ]

@@ -1,23 +1,29 @@
 # === config/settings.py ===
 """
-DataGenius PRO - Central Configuration (PRO+++)
-Type-safe config via Pydantic v2 + pydantic-settings, z walidacją i
-bezpiecznymi guardami dla środowiska produkcyjnego.
+DataGenius PRO - Central Configuration (PRO++++++)
+Type-safe config via Pydantic v2 + pydantic-settings, z walidacją
+i bezpiecznymi guardami dla środowiska produkcyjnego.
+
+Uwaga:
+- Dodano LOG_JSON_ENABLED/LOG_ROTATION/LOG_RETENTION (używane w logging_config.py)
+- Dodano API_KEY (używane w routes.verify_api_key)
+- Dodano API_MAX_ROWS/API_MAX_COLUMNS/API_MAX_CSV_BYTES (używane w schemas.py)
+- Dodano sanity-check LLM provider/model
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Literal, Iterable
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from pydantic import Field, field_validator, model_validator, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Eager load .env (pozwala na lokalny develop bez exportów)
+# Eager load .env (lokalny develop bez exportów)
 load_dotenv()
 
-# Project root (stabilne, z resolve() dla linków)
+# Katalog projektu (stabilny, resolve() dla linków/symlinków)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -33,6 +39,11 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     LOG_LEVEL: str = "INFO"
 
+    # Logging – dodatkowe pola używane przez logging_config
+    LOG_JSON_ENABLED: bool = True
+    LOG_ROTATION: str = "10 MB"
+    LOG_RETENTION: str = "30 days"
+
     # -------------------------------------------
     # === LLM ===
     # -------------------------------------------
@@ -40,8 +51,9 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = Field(default=None, repr=False)
     DEFAULT_LLM_PROVIDER: Literal["anthropic", "openai"] = "anthropic"
 
-    # Domyślny model zgodny z providerem; można nadpisać .env
-    LLM_MODEL: str = "claude-sonnet-4-20250514"
+    # Domyślny model zgodny z providerem (można nadpisać .env)
+    # Przy niespójności z DEFAULT_LLM_PROVIDER zostanie „samouzdrawiane” w validatorze.
+    LLM_MODEL: str = "claude-3-5-sonnet-20240620"
     LLM_MAX_TOKENS: int = 4096
     LLM_TEMPERATURE: float = 0.7
 
@@ -119,6 +131,14 @@ class Settings(BaseSettings):
     API_WORKERS: int = 4
     API_RELOAD: bool = True
 
+    # Do autoryzacji w FastAPI (routes.verify_api_key)
+    API_KEY: Optional[str] = Field(default=None, repr=False)
+
+    # Limity na wejście (używane w schemas.py)
+    API_MAX_ROWS: int = 2_000_000
+    API_MAX_COLUMNS: int = 2_000
+    API_MAX_CSV_BYTES: int = 25_000_000  # 25 MB
+
     # -------------------------------------------
     # === SECURITY ===
     # -------------------------------------------
@@ -191,6 +211,10 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:  # type: ignore[override]
         return self.ENVIRONMENT == "development"
 
+    @computed_field(return_type=bool)
+    def db_is_sqlite(self) -> bool:  # type: ignore[override]
+        return bool(self.DATABASE_URL and "sqlite" in self.DATABASE_URL)
+
     # -------------------------------------------
     # === VALIDATORS ===
     # -------------------------------------------
@@ -217,6 +241,13 @@ class Settings(BaseSettings):
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    @field_validator("MAX_UPLOAD_SIZE_MB")
+    @classmethod
+    def _validate_max_upload(cls, v: int) -> int:
+        if v <= 0 or v > 10_000:
+            raise ValueError("MAX_UPLOAD_SIZE_MB must be in range 1..10000")
+        return v
+
     @model_validator(mode="after")
     def _validate_ports_and_security(self) -> "Settings":
         self._ensure_port_range("API_PORT", self.API_PORT)
@@ -229,6 +260,15 @@ class Settings(BaseSettings):
             insecure = ("change-me-in-production", "", None)
             if self.SECRET_KEY in insecure or self.JWT_SECRET_KEY in insecure:
                 raise ValueError("In production you must set strong SECRET_KEY and JWT_SECRET_KEY")
+
+        # Sanity provider ↔ model
+        lm = (self.LLM_MODEL or "").lower()
+        if self.DEFAULT_LLM_PROVIDER == "openai" and "gpt" not in lm:
+            # samouzdrawianie – unikamy twardego faila przez złe .env
+            self.LLM_MODEL = "gpt-4o"
+        if self.DEFAULT_LLM_PROVIDER == "anthropic" and "claude" not in lm:
+            self.LLM_MODEL = "claude-3-5-sonnet-20240620"
+
         return self
 
     @staticmethod
@@ -243,7 +283,6 @@ class Settings(BaseSettings):
         """Build DB URL if not sqlite DSN."""
         if self.DATABASE_URL and "sqlite" in self.DATABASE_URL:
             return self.DATABASE_URL
-        # prefer explicit DATABASE_URL if set to non-sqlite
         if self.DATABASE_URL and self.DATABASE_URL.strip() and "://" in self.DATABASE_URL:
             return self.DATABASE_URL
         return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"

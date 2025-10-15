@@ -1,7 +1,10 @@
 # === schemas.py ===
 """
-DataGenius PRO - API Schemas (PRO+++)
-Centralne kontrakty Pydantic + utilsy serializacji/parsingu dla backend API.
+DataGenius PRO - API Schemas (PRO++++++)
+Central contracts (Pydantic) + robust parsing/serialization utils.
+- Works with Pydantic v2 (preferred) and v1 (fallback).
+- JSON-safe encoders for numpy/pandas/plotly.
+- Defensive CSV size & shape limits.
 """
 
 from __future__ import annotations
@@ -16,83 +19,115 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-# FastAPI/Pydantic
-from pydantic import BaseModel, Field, validator
-
-# === KONFIGURACJA / LIMITY (próba z settings, z bezpiecznym fallbackiem) ===
+# ---- Settings / limits (safe fallbacks) --------------------------------------
 try:
     from config.settings import settings  # type: ignore
-    API_MAX_ROWS: int = getattr(settings, "API_MAX_ROWS", 2_000_000)
-    API_MAX_COLUMNS: int = getattr(settings, "API_MAX_COLUMNS", 2_000)
-    API_MAX_CSV_BYTES: int = getattr(settings, "API_MAX_CSV_BYTES", 25_000_000)  # 25 MB
+    API_MAX_ROWS: int = int(getattr(settings, "API_MAX_ROWS", 2_000_000))
+    API_MAX_COLUMNS: int = int(getattr(settings, "API_MAX_COLUMNS", 2_000))
+    API_MAX_CSV_BYTES: int = int(getattr(settings, "API_MAX_CSV_BYTES", 25_000_000))  # 25 MB
 except Exception:
     API_MAX_ROWS = 2_000_000
     API_MAX_COLUMNS = 2_000
     API_MAX_CSV_BYTES = 25_000_000
 
+# ---- Pydantic v2 / v1 compatibility layer -----------------------------------
+try:  # Pydantic v2
+    from pydantic import BaseModel, Field, field_validator, ConfigDict
 
-# === ENUMY / LITERALe ===
+    _V2 = True
+
+    class _NPFriendlyModel(BaseModel):
+        model_config = ConfigDict(
+            arbitrary_types_allowed=True,
+            json_encoders={
+                # numpy
+                np.integer: int,
+                np.floating: float,
+                np.bool_: bool,
+                np.ndarray: lambda a: a.tolist(),
+                # pandas
+                pd.Timestamp: lambda ts: ts.isoformat(),
+                pd.Series: lambda s: s.tolist(),
+                pd.DataFrame: lambda df: json.loads(df.to_json(orient="records")),
+            },
+        )
+
+except Exception:  # Pydantic v1
+    from pydantic import BaseModel, Field, validator  # type: ignore
+
+    _V2 = False
+
+    class _NPFriendlyModel(BaseModel):  # type: ignore
+        class Config:
+            arbitrary_types_allowed = True
+            json_encoders = {
+                np.integer: int,
+                np.floating: float,
+                np.bool_: bool,
+                np.ndarray: lambda a: a.tolist(),
+                pd.Timestamp: lambda ts: ts.isoformat(),
+                pd.Series: lambda s: s.tolist(),
+                pd.DataFrame: lambda df: json.loads(df.to_json(orient="records")),
+            }
+
+# ---- Literals / enums --------------------------------------------------------
 ProblemTypeEnum = Literal["classification", "regression"]
 ReportFormatEnum = Literal["html", "pdf", "markdown"]
 
-
-# === KLASY BAZOWE Pydantic z encoderami Numpy/Pandas/Plotly ===
-class _NumpyPandasFriendlyModel(BaseModel):
-    class Config:
-        arbitrary_types_allowed = True
-
-        json_encoders = {
-            # numpy scalars/arrays
-            np.integer: int,
-            np.floating: float,
-            np.bool_: bool,
-            np.ndarray: lambda a: a.tolist(),
-            # pandas
-            pd.Timestamp: lambda ts: ts.isoformat(),
-            pd.Series: lambda s: s.tolist(),
-            pd.DataFrame: lambda df: json.loads(df.to_json(orient="records")),
-        }
-
-
-# === MODELE WEJŚCIOWE / WYJŚCIOWE ===
-class DataPayload(_NumpyPandasFriendlyModel):
+# ---- Models ------------------------------------------------------------------
+class DataPayload(_NPFriendlyModel):
     """
-    Elastyczny payload na dane:
-    - records: list[dict] (zalecane dla mniejszych wsadów),
-    - csv_text: str (ciąg CSV, UTF-8).
+    Flexible data payload:
+      - records: list of dict rows (good for smaller payloads)
+      - csv_text: raw CSV (UTF-8)
     """
     records: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="Lista rekordów (rekord = dict kolumna->wartość)."
+        default=None, description="List of records (row=dict col->value)."
     )
     csv_text: Optional[str] = Field(
-        default=None, description="Zawartość CSV jako UTF-8 (string)."
+        default=None, description="CSV content as UTF-8 string."
     )
     target_column: Optional[str] = Field(default=None)
 
-    @validator("records", always=True)
-    def _at_least_one_source(cls, v, values):
-        if not v and not values.get("csv_text"):
-            raise ValueError("Provide either 'records' or 'csv_text'.")
-        return v
+    if _V2:
+        @field_validator("records")
+        @classmethod
+        def _at_least_one_source_v2(cls, v, info):
+            if not v and not (info.data.get("csv_text")):
+                raise ValueError("Provide either 'records' or 'csv_text'.")
+            return v
 
-    @validator("csv_text")
-    def _csv_text_size_guard(cls, v):
-        if v is not None and len(v.encode("utf-8", errors="ignore")) > API_MAX_CSV_BYTES:
-            raise ValueError(f"CSV payload too large (> {API_MAX_CSV_BYTES} bytes).")
-        return v
+        @field_validator("csv_text")
+        @classmethod
+        def _csv_text_size_guard_v2(cls, v: Optional[str]):
+            if v is not None and len(v.encode("utf-8", errors="ignore")) > API_MAX_CSV_BYTES:
+                raise ValueError(f"CSV payload too large (> {API_MAX_CSV_BYTES} bytes).")
+            return v
+    else:  # v1
+        @validator("records", always=True)
+        def _at_least_one_source_v1(cls, v, values):
+            if not v and not values.get("csv_text"):
+                raise ValueError("Provide either 'records' or 'csv_text'.")
+            return v
+
+        @validator("csv_text")
+        def _csv_text_size_guard_v1(cls, v):
+            if v is not None and len(v.encode("utf-8", errors="ignore")) > API_MAX_CSV_BYTES:
+                raise ValueError(f"CSV payload too large (> {API_MAX_CSV_BYTES} bytes).")
+            return v
 
 
 class EDARequest(DataPayload):
     problem_type_hint: Optional[ProblemTypeEnum] = Field(
-        default=None, description="Opcjonalna podpowiedź problemu."
+        default=None, description="Optional problem-type hint."
     )
     target_override: Optional[str] = Field(
-        default=None, description="Wymuszony target (priorytet nad auto/LLM)."
+        default=None, description="Force target column (overrides auto-detection)."
     )
     include_visuals: bool = Field(default=True)
 
 
-class ReportRequest(_NumpyPandasFriendlyModel):
+class ReportRequest(_NPFriendlyModel):
     eda_results: Dict[str, Any]
     data_info: Dict[str, Any]
     format: ReportFormatEnum = Field(default="html")
@@ -107,7 +142,7 @@ class PipelineRequest(DataPayload):
     problem_type: Optional[ProblemTypeEnum] = Field(default=None)
 
 
-class StandardResponse(_NumpyPandasFriendlyModel):
+class StandardResponse(_NPFriendlyModel):
     status: Literal["ok", "error"]
     data: Optional[Dict[str, Any]] = None
     warnings: Optional[List[str]] = None
@@ -115,24 +150,22 @@ class StandardResponse(_NumpyPandasFriendlyModel):
     request_id: str
     ts: str
 
-
-# === UTILS: CZAS/JSON/SERIALIZACJA ===
+# ---- Utils: time/json/serialization -----------------------------------------
 def now_iso() -> str:
-    """UTC ISO-8601 (sekundy)."""
+    """UTC ISO-8601 (seconds)."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
 
 def safe_jsonify(obj: Any) -> Any:
     """
-    Bezpieczna serializacja rekurencyjna:
-    - plotly.Figure -> dict(JSON),
-    - pandas.DataFrame/Series -> list/dict,
-    - numpy -> Python/native,
-    - zagnieżdżone dict/list -> rekurencyjnie.
+    Safe, recursive JSON-ification:
+      - plotly.Figure -> dict (JSON)
+      - pandas DataFrame/Series -> records/list
+      - numpy -> native Python types
+      - nested dict/list handled recursively
     """
-    # plotly Figure → JSON
+    # plotly Figure → JSON dict
     try:
-        import plotly.graph_objects as go  # lazy import
+        import plotly.graph_objects as go  # lazy
         if isinstance(obj, go.Figure):
             return json.loads(obj.to_json())
     except Exception:
@@ -154,17 +187,15 @@ def safe_jsonify(obj: Any) -> Any:
     if isinstance(obj, np.ndarray):
         return obj.tolist()
 
-    # dict/list recurse
+    # containers
     if isinstance(obj, dict):
         return {k: safe_jsonify(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [safe_jsonify(v) for v in obj]
 
-    # prymitywy
     return obj
 
-
-# === UTILS: PARSING DANYCH ===
+# ---- Utils: parsing ----------------------------------------------------------
 @dataclass(frozen=True)
 class ParsedInfo:
     shape: tuple
@@ -172,13 +203,11 @@ class ParsedInfo:
     memory_mb: float
     n_missing: int
 
-
 def parse_payload_to_df(payload: DataPayload) -> pd.DataFrame:
     """
-    Parsuje DataPayload do DataFrame z defensywną walidacją i limitami.
-    - records: buduje DF bezpośrednio,
-    - csv_text: pd.read_csv na StringIO (UTF-8),
-    - waliduje shape i limity.
+    Parse DataPayload -> DataFrame with defensive validation & limits.
+      - records: direct DataFrame
+      - csv_text: pandas read_csv on StringIO (UTF-8)
     """
     try:
         if payload.records:
@@ -187,19 +216,19 @@ def parse_payload_to_df(payload: DataPayload) -> pd.DataFrame:
             assert isinstance(payload.csv_text, str)
             df = pd.read_csv(io.StringIO(payload.csv_text))
     except Exception as e:
-        logger.error(f"parse_payload_to_df: failed to parse: {e}")
+        logger.error(f"parse_payload_to_df: failed: {e}")
         raise ValueError(f"Invalid data payload: {e}")
 
     if df is None or df.empty:
         raise ValueError("Parsed DataFrame is empty.")
 
-    # limity
+    # shape limits
     if df.shape[0] > API_MAX_ROWS:
         raise ValueError(f"Too many rows: {df.shape[0]} > {API_MAX_ROWS}")
     if df.shape[1] > API_MAX_COLUMNS:
         raise ValueError(f"Too many columns: {df.shape[1]} > {API_MAX_COLUMNS}")
 
-    # normalizacja nazw kolumn (opcjonalnie: strip)
+    # normalize column names
     try:
         df.columns = [str(c).strip() for c in df.columns]
     except Exception:
@@ -208,8 +237,7 @@ def parse_payload_to_df(payload: DataPayload) -> pd.DataFrame:
     logger.info(f"Parsed DataFrame shape={df.shape}, columns={len(df.columns)}")
     return df
 
-
-# === EXPORTED SYMBOLS ===
+# ---- Exports -----------------------------------------------------------------
 __all__ = [
     "ProblemTypeEnum",
     "ReportFormatEnum",
