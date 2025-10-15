@@ -1,17 +1,19 @@
 # === drift_detector.py ===
 """
-DataGenius PRO - Drift Detector (PRO+++)
-Detekcja data drift i opcjonalnie concept/performance drift między zbiorem referencyjnym
-a bieżącym. Wspiera cechy numeryczne i kategoryczne, oferuje PSI/KS/Chi2/Wasserstein/
-Cramér's V i czytelne rekomendacje.
+DataGenius PRO - Drift Detector (PRO++++++)
+Detekcja data drift (i opcjonalnie concept/performance drift) między zbiorem referencyjnym
+a bieżącym. Wspiera cechy numeryczne/kategoryczne/datetime, oferuje PSI/KS/Chi2/Wasserstein/
+Cramér's V, bandy jakości, telemetry i czytelne rekomendacje. Zachowuje porządek kolumn
+i jest odporny na braki/stałe cechy/sampling.
 
-Zależności: numpy, pandas, scipy, sklearn (tylko metryki).
+Zależności: numpy, pandas, scipy, scikit-learn (tylko metryki), loguru.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
+import time
 
 import numpy as np
 import pandas as pd
@@ -24,22 +26,30 @@ from core.base_agent import BaseAgent, AgentResult
 # === KONFIG ===
 @dataclass(frozen=True)
 class DriftConfig:
-    alpha: float = 0.05                    # poziom istotności testów statystycznych
-    psi_bins: int = 10                     # liczba koszyków PSI dla numeryków
-    max_features: Optional[int] = None     # limit liczby cech (None = wszystkie)
-    sample_size: int = 100_000             # maks. próbek z każdej próby do statystyk
-    min_non_null_ratio: float = 0.5        # minimalny udział nie-NaN aby oceniać cechę
-    psi_warn_threshold: float = 0.1        # PSI: 0.1-0.2 umiarkowany drift, >0.2 silny
-    psi_crit_threshold: float = 0.2
-    ks_warn_threshold: float = 0.1         # KS stat heurystycznie (nie p-value)
-    wdist_warn_threshold: float = 0.2      # Wasserstein (znormalizowany; patrz implementacja)
-    cramer_warn_threshold: float = 0.2     # Cramér's V heurystyka
-    topk_categorical: int = 5              # ile top kategorii porównywać
+    # Statystyki / testy
+    alpha: float = 0.05                   # poziom istotności testów statystycznych
+    psi_bins: int = 10                    # liczba koszyków PSI dla numeryków
+
+    # Limity analizy
+    max_features: Optional[int] = None    # limit liczby cech (None = wszystkie)
+    sample_size: int = 100_000            # maks. próbek z każdej próby do statystyk
+    min_non_null_ratio: float = 0.5       # minimalny udział nie-NaN aby oceniać cechę
+
+    # Progi heurystyk
+    psi_warn_threshold: float = 0.10      # PSI: 0.1-0.2 umiarkowany drift, >0.2 silny
+    psi_crit_threshold: float = 0.20
+    ks_warn_threshold: float = 0.10       # KS stat heurystycznie (nie p-value)
+    wdist_warn_threshold: float = 0.20    # Wasserstein (znormalizowany robustowo)
+    cramer_warn_threshold: float = 0.20   # Cramér's V heurystyka
+
+    # Analiza kategorii
+    topk_categorical: int = 5             # ile top kategorii/zmian porównywać
 
 
 class DriftDetector(BaseAgent):
     """
     Wykrywa drift cech (data drift), drift targetu oraz (opcjonalnie) drift wydajności modelu.
+    Zwraca spójny kontrakt kompatybilny z PerformanceTracker / RetrainingScheduler.
     """
 
     def __init__(self, config: Optional[DriftConfig] = None):
@@ -87,11 +97,12 @@ class DriftDetector(BaseAgent):
             pred_ref, pred_cur: predykcje modelu (opcjonalnie)
         """
         result = AgentResult(agent_name=self.name)
+        t0 = time.perf_counter()
         try:
             # 0) Preprocessing / próbkowanie (dla wydajności)
             ref, cur = self._align_and_sample(reference_data, current_data)
 
-            # 1) Uzgodnij schemat
+            # 1) Uzgodnij schemat (zachowanie kolejności kolumn)
             schema_info, common_cols = self._schema_alignment(ref, cur, target_column)
 
             # 2) Detekcja typów
@@ -103,40 +114,56 @@ class DriftDetector(BaseAgent):
                 feature_list = feature_list[: self.config.max_features]
 
             # 3) Data drift per feature
-            per_feature = {}
+            per_feature: Dict[str, Dict[str, Any]] = {}
             drifted_features: List[str] = []
 
+            # cache numerycznych wszystkich ref (dla niektórych strategii, pozostawiamy arg)
+            ref_all_numeric = ref[[c for c in feature_list if pd.api.types.is_numeric_dtype(ref[c])]] if len(feature_list) else pd.DataFrame()
+
             for col in feature_list:
-                if ftypes[col] == "numeric":
-                    m = self._drift_numeric(ref[col], cur[col], ref[feature_list])
-                elif ftypes[col] == "categorical":
+                ftype = ftypes[col]
+                if ftype == "numeric":
+                    m = self._drift_numeric(ref[col], cur[col], ref_all_numeric)
+                elif ftype == "categorical":
                     m = self._drift_categorical(ref[col], cur[col])
-                else:
-                    # datetime – ocena jako numeric (timestamp) lub pomijamy
-                    try:
-                        m = self._drift_datetime(ref[col], cur[col])
-                    except Exception:
-                        m = {"skipped": True, "reason": "unsupported_datetime"}
+                else:  # datetime
+                    m = self._drift_datetime(ref[col], cur[col])
                 per_feature[col] = m
                 if bool(m.get("is_drift", False)):
                     drifted_features.append(col)
 
-            drift_score = (len(drifted_features) / max(1, len(feature_list))) * 100.0
+            # Drift score liczony po O-C-E-N-I-O-N-Y-C-H cechach (bez "skipped")
+            evaluated = [c for c, m in per_feature.items() if not m.get("skipped")]
+            drift_score = (len(drifted_features) / max(1, len(evaluated))) * 100.0
 
             data_drift = {
                 "per_feature": per_feature,
                 "drifted_features": drifted_features,
                 "n_drifted": len(drifted_features),
                 "drift_score": float(drift_score),
+                # alias kompatybilny z planistami/reporterami:
+                "pct_drifted_features": float(drift_score),
             }
 
             # 4) Target drift (opcjonalny)
             target_drift = None
             if target_column and target_column in ref.columns and target_column in cur.columns:
-                if ftypes[target_column] == "numeric":
-                    target_drift = self._drift_numeric(ref[target_column], cur[target_column], ref[feature_list])
+                if ftypes.get(target_column, "categorical") == "numeric":
+                    target_drift = self._drift_numeric(ref[target_column], cur[target_column], ref_all_numeric)
                 else:
-                    target_drift = self._drift_categorical(ref[target_column], cur[target_column])
+                    td = self._drift_categorical(ref[target_column], cur[target_column])
+                    # dodatki pod raporty: największe przesunięcie udziału klasy
+                    try:
+                        top_delta = td.get("topk_delta", {})
+                        major_class_shift = None
+                        if top_delta:
+                            # max bezwzględnej zmiany udziału (w p.p.)
+                            k_max = max(top_delta, key=lambda k: abs(top_delta[k]))
+                            major_class_shift = {"class": k_max, "delta": float(top_delta[k_max])}
+                        td["major_class_shift"] = major_class_shift
+                    except Exception:
+                        pass
+                    target_drift = td
 
             # 5) Performance drift (opcjonalny – jeśli mamy y & pred)
             perf_drift = None
@@ -147,6 +174,16 @@ class DriftDetector(BaseAgent):
             summary = self._build_summary(data_drift, target_drift, perf_drift, len(ref), len(cur))
             recommendations = self._recommendations(data_drift, target_drift, perf_drift)
 
+            # 7) Telemetria
+            telemetry = {
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "sampled_ref": len(reference_data) > self.config.sample_size,
+                "sampled_cur": len(current_data) > self.config.sample_size,
+                "sample_size": int(self.config.sample_size),
+                "evaluated_features": len(evaluated),
+                "total_common_features": len(feature_list),
+            }
+
             result.data = {
                 "schema": schema_info,
                 "data_drift": data_drift,
@@ -154,11 +191,12 @@ class DriftDetector(BaseAgent):
                 "performance_drift": perf_drift,
                 "summary": summary,
                 "recommendations": recommendations,
+                "telemetry": telemetry,
             }
 
             self.logger.success(
-                f"Drift analysis complete: {data_drift['n_drifted']}/{len(feature_list)} "
-                f"features drifted (score={drift_score:.1f}%)"
+                f"Drift analysis complete: {data_drift['n_drifted']}/{max(1,len(evaluated))} "
+                f"evaluated features drifted (score={drift_score:.1f}%)"
             )
         except Exception as e:
             result.add_error(f"Drift detection failed: {e}")
@@ -168,8 +206,7 @@ class DriftDetector(BaseAgent):
 
     # === SCHEMA & SAMPLING ===
     def _align_and_sample(self, ref: pd.DataFrame, cur: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Wyrównaj kolumny i próbkowanie do ustawionych limitów."""
-        # Kolumny wspólne zachowamy później; tu tylko sampling
+        """Próbkuj duże zbiory dla wydajności; kolumny wyrównujemy osobno (z zachowaniem kolejności)."""
         ref_s = ref
         cur_s = cur
         try:
@@ -187,20 +224,14 @@ class DriftDetector(BaseAgent):
         cur: pd.DataFrame,
         target_column: Optional[str]
     ) -> Tuple[Dict[str, Any], List[str]]:
-        ref_cols = set(ref.columns)
-        cur_cols = set(cur.columns)
-        common = list(ref_cols.intersection(cur_cols))
-        only_ref = list(ref_cols - cur_cols)
-        only_cur = list(cur_cols - ref_cols)
-
-        # Upewnij się, że target (jeśli jest w obu) będzie w common na końcu
-        if target_column and target_column in common:
-            # nic specjalnego — zostawiamy
-            pass
+        # zachowaj kolejność
+        common = [c for c in ref.columns if c in cur.columns]
+        only_ref = [c for c in ref.columns if c not in cur.columns]
+        only_cur = [c for c in cur.columns if c not in ref.columns]
 
         schema = {
-            "n_ref_cols": len(ref_cols),
-            "n_cur_cols": len(cur_cols),
+            "n_ref_cols": int(len(ref.columns)),
+            "n_cur_cols": int(len(cur.columns)),
             "common_cols": common,
             "only_in_reference": only_ref,
             "only_in_current": only_cur,
@@ -228,6 +259,20 @@ class DriftDetector(BaseAgent):
         return ftypes
 
     # === METRYKI DRIFTU: NUMERYCZNE ===
+    def _robust_scale(self, x: pd.Series) -> float:
+        """Robustowa skala: MAD → IQR → std → 1.0 (fallback)."""
+        arr = np.asarray(x, dtype=float)
+        med = np.nanmedian(arr)
+        mad = np.nanmedian(np.abs(arr - med))
+        if mad > 0:
+            return float(1.4826 * mad)  # ~sigma
+        q75, q25 = np.nanpercentile(arr, 75), np.nanpercentile(arr, 25)
+        iqr = q75 - q25
+        if iqr > 0:
+            return float(iqr / 1.349)   # ~sigma
+        s = np.nanstd(arr)
+        return float(s) if s > 0 else 1.0
+
     def _drift_numeric(self, s_ref: pd.Series, s_cur: pd.Series, ref_all_numeric: pd.DataFrame) -> Dict[str, Any]:
         m: Dict[str, Any] = {}
         try:
@@ -237,9 +282,9 @@ class DriftDetector(BaseAgent):
 
             # Sprawdź obserwowalność
             if len(r) / max(1, len(s_ref)) < self.config.min_non_null_ratio:
-                return {"skipped": True, "reason": "too_many_missing_reference"}
+                return {"skipped": True, "reason": "too_many_missing_reference", "type": "numeric"}
             if len(c) / max(1, len(s_cur)) < self.config.min_non_null_ratio:
-                return {"skipped": True, "reason": "too_many_missing_current"}
+                return {"skipped": True, "reason": "too_many_missing_current", "type": "numeric"}
 
             # PSI: koszyki oparte o referencję (kwantyle)
             psi, psi_bins = self._psi_numeric(r, c, bins=self.config.psi_bins)
@@ -247,22 +292,22 @@ class DriftDetector(BaseAgent):
             # KS test
             ks_stat, ks_p = ks_2samp(r, c)
 
-            # Wasserstein — znormalizujemy przez odchylenie referencji (stabilniejsza skala)
-            scale = np.nanstd(r) or 1.0
-            wdist = float(wasserstein_distance(r, c) / scale)
+            # Wasserstein — robust scale
+            scale = self._robust_scale(r)
+            wdist = float(wasserstein_distance(r, c) / (scale if scale > 0 else 1.0))
 
             # Heurystyczna decyzja o drifcie
-            flags = []
+            flags: List[str] = []
             if psi is not None and psi >= self.config.psi_crit_threshold:
                 flags.append("psi_critical")
-            if psi is not None and (self.config.psi_warn_threshold <= psi < self.config.psi_crit_threshold):
+            elif psi is not None and psi >= self.config.psi_warn_threshold:
                 flags.append("psi_warn")
             if ks_p is not None and ks_p < self.config.alpha:
                 flags.append("ks_significant")
             if ks_stat is not None and ks_stat >= self.config.ks_warn_threshold:
                 flags.append("ks_high")
             if wdist is not None and wdist >= self.config.wdist_warn_threshold:
-                flags.append("wdist_high")
+                flags.append("wasserstein_high")
 
             m.update({
                 "type": "numeric",
@@ -286,19 +331,18 @@ class DriftDetector(BaseAgent):
             # Kwantylowe granice na referencji
             qs = np.linspace(0, 1, bins + 1)
             cuts = np.unique(np.nanquantile(ref, qs))
-            # safetynet gdy wszystkie wartości zbliżone
+            # Safetynet: stała/niemal stała cecha
             if len(cuts) <= 2:
-                # fallback: jednorodne kosze wg min/max
                 vmin, vmax = np.nanmin(ref), np.nanmax(ref)
                 if vmin == vmax:
-                    return 0.0, []
+                    return 0.0, [{"note": "constant_or_near_constant_bins"}]
                 cuts = np.linspace(vmin, vmax, bins + 1)
 
             ref_hist, _ = np.histogram(ref, bins=cuts)
             cur_hist, _ = np.histogram(cur, bins=cuts)
 
-            ref_pct = np.where(ref_hist == 0, 1e-6, ref_hist / ref_hist.sum())
-            cur_pct = np.where(cur_hist == 0, 1e-6, cur_hist / cur_hist.sum())
+            ref_pct = np.where(ref_hist == 0, 1e-6, ref_hist / max(1, ref_hist.sum()))
+            cur_pct = np.where(cur_hist == 0, 1e-6, cur_hist / max(1, cur_hist.sum()))
 
             psi_vals = (ref_pct - cur_pct) * np.log(ref_pct / cur_pct)
             psi = float(np.sum(psi_vals))
@@ -306,7 +350,7 @@ class DriftDetector(BaseAgent):
             bins_out: List[Dict[str, Any]] = []
             for i in range(len(cuts) - 1):
                 bins_out.append({
-                    "bin": i,
+                    "bin": int(i),
                     "left": float(cuts[i]),
                     "right": float(cuts[i+1]),
                     "ref_pct": float(ref_pct[i]),
@@ -338,7 +382,7 @@ class DriftDetector(BaseAgent):
             ref_pct = ref_counts / max(1, ref_counts.sum())
             cur_pct = cur_counts / max(1, cur_counts.sum())
 
-            # PSI kategoryczny
+            # PSI kategoryczny (bez zera)
             ref_safe = ref_pct.replace(0, 1e-6)
             cur_safe = cur_pct.replace(0, 1e-6)
             psi_vals = (ref_safe - cur_safe) * np.log(ref_safe / cur_safe)
@@ -360,7 +404,7 @@ class DriftDetector(BaseAgent):
             top_cur = cur_pct.sort_values(ascending=False).head(k)
             top_diff = (top_cur - top_ref).fillna(0.0).sort_values(key=np.abs, ascending=False).head(k).to_dict()
 
-            flags = []
+            flags: List[str] = []
             if psi >= self.config.psi_crit_threshold:
                 flags.append("psi_critical")
             elif psi >= self.config.psi_warn_threshold:
@@ -386,13 +430,12 @@ class DriftDetector(BaseAgent):
             self.logger.warning(f"Categorical drift calc failed: {e}")
             return {"error": str(e), "type": "categorical"}
 
-    # === DATETIME (opcjonalnie numerycznie po timestampie) ===
+    # === DATETIME (analiza numeryczna po timestampie) ===
     def _drift_datetime(self, s_ref: pd.Series, s_cur: pd.Series) -> Dict[str, Any]:
         try:
-            r = pd.to_datetime(s_ref, errors="coerce").dropna().astype("int64") // 10**9
-            c = pd.to_datetime(s_cur, errors="coerce").dropna().astype("int64") // 10**9
-            # użyj metryk numerycznych
-            return self._drift_numeric(r, c, pd.DataFrame())
+            r = pd.to_datetime(s_ref, errors="coerce").dropna().view("int64") / 1e9
+            c = pd.to_datetime(s_cur, errors="coerce").dropna().view("int64") / 1e9
+            return self._drift_numeric(pd.Series(r), pd.Series(c), pd.DataFrame())
         except Exception as e:
             self.logger.warning(f"Datetime drift calc failed: {e}")
             return {"error": str(e), "type": "datetime"}
@@ -412,50 +455,69 @@ class DriftDetector(BaseAgent):
 
         out: Dict[str, Any] = {}
         try:
-            # Spróbuj rozpoznać typ problemu
-            is_numeric = pd.api.types.is_numeric_dtype(y_ref) and y_ref.nunique() > 10
-            if is_numeric:
+            # lepsza detekcja typu
+            is_reg = pd.api.types.is_float_dtype(y_ref) or pd.api.types.is_float_dtype(y_cur)
+            if not is_reg and (pd.api.types.is_numeric_dtype(y_ref) and y_ref.nunique(dropna=True) > 20):
+                is_reg = True
+
+            if is_reg:
                 # Regresja
                 def reg_metrics(y, p):
                     d: Dict[str, float] = {}
-                    try: d["r2"] = r2_score(y, p)
+                    try: d["r2"] = float(r2_score(y, p))
                     except Exception: pass
-                    try: 
-                        mse = mean_squared_error(y, p); d["mse"] = mse; d["rmse"] = float(np.sqrt(mse))
+                    try:
+                        mse = mean_squared_error(y, p); d["mse"] = float(mse); d["rmse"] = float(np.sqrt(mse))
                     except Exception: pass
-                    try: d["mae"] = mean_absolute_error(y, p)
+                    try: d["mae"] = float(mean_absolute_error(y, p))
                     except Exception: pass
                     return d
 
                 ref_m = reg_metrics(y_ref, pred_ref)
                 cur_m = reg_metrics(y_cur, pred_cur)
+                primary = "r2"
             else:
                 # Klasyfikacja
                 average = "weighted"
                 def cls_metrics(y, p):
                     d: Dict[str, float] = {}
-                    try: d["accuracy"] = accuracy_score(y, p)
+                    try: d["accuracy"] = float(accuracy_score(y, p))
                     except Exception: pass
-                    try: d["f1"] = f1_score(y, p, average=average, zero_division=0)
+                    try: d["f1"] = float(f1_score(y, p, average=average, zero_division=0))
                     except Exception: pass
-                    try: d["precision"] = precision_score(y, p, average=average, zero_division=0)
+                    try: d["precision"] = float(precision_score(y, p, average=average, zero_division=0))
                     except Exception: pass
-                    try: d["recall"] = recall_score(y, p, average=average, zero_division=0)
+                    try: d["recall"] = float(recall_score(y, p, average=average, zero_division=0))
                     except Exception: pass
                     return d
 
                 ref_m = cls_metrics(y_ref, pred_ref)
                 cur_m = cls_metrics(y_cur, pred_cur)
+                primary = "accuracy"
 
             # Delta metryk (cur - ref)
             delta = {k: float(cur_m.get(k, np.nan) - ref_m.get(k, np.nan)) for k in set(ref_m) | set(cur_m)}
-            out = {"reference": ref_m, "current": cur_m, "delta": delta}
+
+            out = {
+                "reference": ref_m,
+                "current": cur_m,
+                "delta": delta,
+                "primary_metric": primary,
+                "primary_delta": float(delta.get(primary, np.nan)),
+            }
             return out
         except Exception as e:
             self.logger.warning(f"Performance drift calc failed: {e}")
             return {"error": str(e)}
 
     # === PODSUMOWANIE & REKOMENDACJE ===
+    def _drift_band(self, pct: float) -> Literal["ok", "warn", "critical"]:
+        if pct >= 30.0:
+            return "critical"
+        if pct >= 10.0:
+            return "warn"
+        return "ok"
+
     def _build_summary(
         self,
         data_drift: Dict[str, Any],
@@ -464,11 +526,13 @@ class DriftDetector(BaseAgent):
         n_ref: int,
         n_cur: int
     ) -> Dict[str, Any]:
+        drift_pct = float(data_drift.get("drift_score", 0.0))
         summary = {
-            "n_reference": n_ref,
-            "n_current": n_cur,
-            "n_drifted_features": data_drift.get("n_drifted", 0),
-            "drift_score_pct": data_drift.get("drift_score", 0.0),
+            "n_reference": int(n_ref),
+            "n_current": int(n_cur),
+            "n_drifted_features": int(data_drift.get("n_drifted", 0)),
+            "drift_score_pct": drift_pct,
+            "drift_band": self._drift_band(drift_pct),
             "has_target_drift": bool(target_drift and target_drift.get("is_drift", False)),
             "has_performance_drift": bool(perf_drift and "delta" in perf_drift),
             "key_triggers_example": self._top_triggers_example(data_drift.get("per_feature", {})),
@@ -477,11 +541,14 @@ class DriftDetector(BaseAgent):
 
     def _top_triggers_example(self, per_feature: Dict[str, Dict[str, Any]]) -> List[str]:
         # Wypisz do 3 najmocniejszych sygnałów (np. najwyższy PSI)
-        scored = []
+        scored: List[Tuple[str, float]] = []
         for col, m in per_feature.items():
             psi = m.get("psi")
             if psi is not None:
-                scored.append((col, float(psi)))
+                try:
+                    scored.append((col, float(psi)))
+                except Exception:
+                    pass
         scored.sort(key=lambda x: x[1], reverse=True)
         return [f"{c}: PSI={v:.3f}" for c, v in scored[:3]]
 
@@ -492,8 +559,8 @@ class DriftDetector(BaseAgent):
         perf_drift: Optional[Dict[str, Any]]
     ) -> List[str]:
         recs: List[str] = []
-        n_drift = data_drift.get("n_drifted", 0)
-        drifted = data_drift.get("drifted_features", [])
+        n_drift = int(data_drift.get("n_drifted", 0))
+        drifted = list(data_drift.get("drifted_features", []) or [])
 
         if n_drift == 0:
             recs.append("✅ Nie wykryto istotnego data driftu — monitoruj dalej w regularnych interwałach.")
@@ -506,16 +573,14 @@ class DriftDetector(BaseAgent):
             recs.append("⚠️ Wykryto drift targetu — zweryfikuj, czy zmieniła się definicja etykiety lub proces etykietowania.")
 
         if perf_drift and "delta" in perf_drift:
-            # heurystyczne zalecenia na bazie spadku kluczowych metryk
             d = perf_drift["delta"]
-            if any(k in d for k in ("accuracy", "f1", "r2")):
-                bad = []
-                for k in ("accuracy", "f1", "r2"):
-                    v = d.get(k)
-                    if isinstance(v, (int, float)) and v < 0:
-                        bad.append(f"{k} {v:.3f}")
-                if bad:
-                    recs.append("📉 Spadek jakości: " + ", ".join(bad) + ". Rozważ aktualizację modelu lub feature store.")
+            bad = []
+            for k in ("accuracy", "f1", "r2"):
+                v = d.get(k)
+                if isinstance(v, (int, float)) and v < 0:
+                    bad.append(f"{k} {v:.3f}")
+            if bad:
+                recs.append("📉 Spadek jakości: " + ", ".join(bad) + ". Rozważ aktualizację modelu lub feature store.")
 
-        recs.append("🧪 Ustal progi operacyjne (np. PSI>0.2) i automatyzuj alarmy w monitoringu.")
-        return recs
+        recs.append("🧪 Ustal progi operacyjne (np. PSI>0.2, Cramér’s V>0.2) i automatyzuj alarmy w monitoringu.")
+        return list(dict.fromkeys(recs))  # dedup, kolejność zachowana

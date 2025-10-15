@@ -1,12 +1,14 @@
 # === encoder_selector.py ===
 """
-DataGenius PRO - Encoder Selector (PRO+++)
+DataGenius PRO - Encoder Selector (PRO++++++)
 Automatyczny dobór, fitting i komponowanie enkoderów dla kolumn kategorycznych
 z obsługą braków, rzadkich kategorii oraz wysokiej krotności. Zwraca gotowy
-sklearn ColumnTransformer oraz szczegółowy plan per kolumna.
+sklearn ColumnTransformer + plan per kolumna + telemetrię.
 
 Zależności podstawowe: pandas, numpy, scikit-learn, loguru
-Opcjonalne: category_encoders (Target/CatBoost/LeaveOneOut/Count)
+Opcjonalne (zalecane): category_encoders (Target/CatBoost/LeaveOneOut/Count/Hashing)
+
+Kompatybilny z resztą orkiestratorów (ModelTrainer/MLOrchestrator).
 """
 
 from __future__ import annotations
@@ -43,24 +45,36 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 @dataclass(frozen=True)
 class EncoderPolicy:
     # Progi krotności
-    max_ohe_unique: int = 20                     # granica do OneHot
-    high_cardinality_abs: int = 50               # >= → wysoka krotność
+    max_ohe_unique: int = 20                     # granica do OneHot dla pojedynczej kolumny
+    high_cardinality_abs: int = 50               # >= → wysoka krotność (liczba unikalnych)
     high_cardinality_ratio: float = 0.30         # unikalne / n_rows
+
+    # Ograniczanie eksplozji wymiarów przy OHE
+    max_ohe_total_features: Optional[int] = 5000 # limit łącznej liczby kolumn po OHE (None = brak limitu)
+
     # Rzadkie kategorie
     rare_min_pct: float = 0.01                   # <1% → <RARE>
+
     # Obsługa braków
-    impute_strategy_categorical: str = "most_frequent"
-    impute_strategy_numeric: str = "median"
-    # Dobór enkoderów zaawansowanych
+    impute_strategy_categorical: Literal["most_frequent", "constant"] = "most_frequent"
+    impute_strategy_numeric: Literal["median", "mean", "most_frequent", "constant"] = "median"
+    add_missing_token: bool = True               # jeżeli True → brak = <MISSING> (przez imputer constant)
+    missing_token: str = "<MISSING>"
+
+    # Dobór enkoderów zaawansowanych (jeśli jest category_encoders)
     enable_target_encoder: bool = True
     enable_catboost_encoder: bool = True
     enable_leave_one_out: bool = True
     enable_count_encoder: bool = True
+    enable_hashing_encoder: bool = True          # bezpieczny dla ekstremalnej krotności
+
     # Zachowanie
     handle_unknown_token: str = "<UNK>"
     rare_token: str = "<RARE>"
-    # Nazwy
+
+    # Nazwy / przejście numeryków
     passthrough_numeric: bool = True
+
     # Repro
     random_state: int = 42
 
@@ -84,7 +98,7 @@ class RareCategoryGrouper(BaseEstimator, TransformerMixin):
         self.columns_ = list(df.columns)
         n = len(df)
         for c in self.columns_:
-            vc = df[c].astype("object").value_counts(dropna=False)
+            vc = df[c].astype("object").astype(str).value_counts(dropna=False)
             pct = vc / max(1, n)
             rare = set(pct[pct < self.min_pct].index.astype(str))
             seen = set(vc.index.astype(str))
@@ -108,14 +122,53 @@ class RareCategoryGrouper(BaseEstimator, TransformerMixin):
         X = np.asarray(X)
         if X.ndim == 1:
             X = X.reshape(-1, 1)
-        # jeśli brak nazw, generuj generyczne
+        cols = self.columns_ if getattr(self, "columns_", None) else [f"col_{i}" for i in range(X.shape[1])]
+        return pd.DataFrame(X, columns=cols)
+
+
+# === TRANSFORMER: Prosty FrequencyEncoder (fallback gdy brak category_encoders.CountEncoder) ===
+class FrequencyEncoder(BaseEstimator, TransformerMixin):
+    """
+    Mapuje kategorie na ich częstość względną (0..1) w danych treningowych.
+    Zwraca DataFrame (kolumna zmieniona na float).
+    """
+    def __init__(self):
+        self.freqs_: Dict[str, Dict[str, float]] = {}
+        self.columns_: List[str] = []
+
+    def fit(self, X: Union[pd.DataFrame, np.ndarray], y: Optional[np.ndarray] = None):
+        df = self._to_df(X)
+        self.columns_ = list(df.columns)
+        n = len(df)
+        for c in self.columns_:
+            vc = df[c].astype("object").astype(str).value_counts(dropna=False)
+            freq = (vc / max(1, n)).to_dict()
+            self.freqs_[c] = {str(k): float(v) for k, v in freq.items()}
+        return self
+
+    def transform(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
+        df = self._to_df(X)
+        out = pd.DataFrame(index=df.index)
+        for c in self.columns_:
+            mapping = self.freqs_.get(c, {})
+            col = df[c].astype("object").astype(str).map(mapping).astype(float)
+            col = col.fillna(0.0)
+            out[c] = col
+        return out
+
+    def _to_df(self, X: Union[pd.DataFrame, np.ndarray]) -> pd.DataFrame:
+        if isinstance(X, pd.DataFrame):
+            return X.copy()
+        X = np.asarray(X)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
         cols = self.columns_ if getattr(self, "columns_", None) else [f"col_{i}" for i in range(X.shape[1])]
         return pd.DataFrame(X, columns=cols)
 
 
 class EncoderSelector(BaseAgent):
     """
-    Dobór i fitting enkoderów dla cech kategorycznych; zwraca ColumnTransformer i plan.
+    Dobór i fitting enkoderów dla cech kategorycznych; zwraca ColumnTransformer + plan + telemetria.
     """
 
     def __init__(self, policy: Optional[EncoderPolicy] = None):
@@ -126,7 +179,9 @@ class EncoderSelector(BaseAgent):
         self.policy = policy or EncoderPolicy()
         self._ce_available = _CE_AVAILABLE
         if not self._ce_available:
-            self.logger.warning("category_encoders not available - zaawansowane enkodery będą zastąpione bezpiecznymi fallbackami.")
+            self.logger.warning(
+                "category_encoders not available — zaawansowane enkodery będą zastąpione bezpiecznymi fallbackami."
+            )
 
     # === WALIDACJA ===
     def validate_input(self, **kwargs) -> bool:
@@ -135,7 +190,6 @@ class EncoderSelector(BaseAgent):
         df = kwargs["data"]
         if not isinstance(df, pd.DataFrame) or df.empty:
             raise ValueError("'data' must be a non-empty pandas DataFrame")
-        # target optional
         return True
 
     # === GŁÓWNY INTERFEJS ===
@@ -176,34 +230,49 @@ class EncoderSelector(BaseAgent):
             cat_cols = self._get_categorical_columns(X)
             num_cols = self._get_numeric_columns(X)
 
+            # Jeśli brak kategorii, tylko numery
             if not cat_cols and self.policy.passthrough_numeric:
                 transformer = ColumnTransformer(
-                    transformers=[("num", Pipeline(steps=[("imputer", SimpleImputer(strategy=self.policy.impute_strategy_numeric))]), num_cols)],
+                    transformers=[(
+                        "num",
+                        Pipeline(steps=[("imputer", SimpleImputer(strategy=self.policy.impute_strategy_numeric))]),
+                        num_cols
+                    )],
                     remainder="drop"
                 )
-                transformer.fit(X)
-                plan = {}
+                transformer.fit(X if y is None else X, None if y is None else y)
                 feature_names = self._safe_feature_names(transformer, input_features=list(X.columns))
                 result.data = {
                     "transformer": transformer,
-                    "plan": plan,
+                    "plan": {},
                     "encoded_feature_names": feature_names,
-                    "summary": {"n_categorical": 0, "n_numeric": len(num_cols)}
+                    "summary": {"n_categorical": 0, "n_numeric": len(num_cols)},
+                    "telemetry": {"ce_available": self._ce_available, "strategy": strategy}
                 }
-                self.logger.info("No categorical columns - numeric passthrough only.")
+                self.logger.info("No categorical columns — numeric passthrough only.")
                 return result
 
             # Analiza kolumn kategorycznych
             stats = self._analyze_categories(X[cat_cols])
 
             # Dobór enkoderów per kolumna
-            selection, recs = self._select_encoders_for_columns(
+            selection, recs, est_ohe_total = self._select_encoders_for_columns(
                 stats=stats,
                 strategy=strategy,
                 has_target=(y is not None),
                 problem_type=problem_type,
                 ordinal_maps=ordinal_maps
             )
+
+            # Limiter eksplozji wymiarów (opcjonalny)
+            warn_dim = None
+            if self.policy.max_ohe_total_features is not None and est_ohe_total is not None:
+                if est_ohe_total > self.policy.max_ohe_total_features:
+                    warn_dim = (
+                        f"Estymowana liczba cech po OHE ≈ {est_ohe_total} przekracza limit "
+                        f"{self.policy.max_ohe_total_features}. Rozważ Target/Count/Hashing."
+                    )
+                    self.logger.warning(warn_dim)
 
             # Budowa ColumnTransformer
             transformer = self._build_transformer(
@@ -214,10 +283,7 @@ class EncoderSelector(BaseAgent):
             )
 
             # Fit
-            if y is not None:
-                transformer.fit(X, y)
-            else:
-                transformer.fit(X)
+            transformer.fit(X if y is None else X, None if y is None else y)
 
             # Nazwy cech po transformacji (jeśli dostępne)
             feature_names = self._safe_feature_names(transformer, input_features=list(X.columns))
@@ -227,16 +293,22 @@ class EncoderSelector(BaseAgent):
                 "transformer": transformer,
                 "plan": selection,
                 "encoded_feature_names": feature_names,
-                "recommendations": recs,
+                "recommendations": recs if recs else None,
                 "summary": {
                     "n_categorical": len(cat_cols),
                     "n_numeric": len(num_cols),
                     "ce_available": self._ce_available,
-                    "strategy": strategy
+                    "strategy": strategy,
+                    "estimated_ohe_total": est_ohe_total
+                },
+                "telemetry": {
+                    "warnings": [warn_dim] if warn_dim else [],
                 }
             }
 
-            self.logger.success(f"Encoder selection completed. Categorical: {len(cat_cols)}, Numeric: {len(num_cols)}")
+            self.logger.success(
+                f"Encoder selection completed. Categorical: {len(cat_cols)}, Numeric: {len(num_cols)}"
+            )
 
         except Exception as e:
             result.add_error(f"Encoder selection failed: {e}")
@@ -246,7 +318,10 @@ class EncoderSelector(BaseAgent):
 
     # === UTIL: typy kolumn ===
     def _get_categorical_columns(self, df: pd.DataFrame) -> List[str]:
-        return [c for c in df.columns if (pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_categorical_dtype(df[c]))]
+        return [
+            c for c in df.columns
+            if (pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_categorical_dtype(df[c]))
+        ]
 
     def _get_numeric_columns(self, df: pd.DataFrame) -> List[str]:
         return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -260,13 +335,17 @@ class EncoderSelector(BaseAgent):
             n_unique = int(s.nunique(dropna=True))
             missing = int(s.isna().sum())
             missing_pct = float(missing / max(1, n) * 100.0)
-            value_counts = s.value_counts(dropna=False)
+            value_counts = s.astype("object").value_counts(dropna=False)
             top5 = value_counts.head(5).to_dict()
             out[c] = {
                 "n_unique": n_unique,
                 "missing_pct": missing_pct,
                 "top_values": {str(k): int(v) for k, v in top5.items()},
-                "high_cardinality": bool(n_unique >= self.policy.high_cardinality_abs or (n_unique / max(1, n)) >= self.policy.high_cardinality_ratio),
+                "high_cardinality": bool(
+                    n_unique >= self.policy.high_cardinality_abs or
+                    (n_unique / max(1, n)) >= self.policy.high_cardinality_ratio
+                ),
+                "value_counts": value_counts,  # do estymacji OHE
             }
         return out
 
@@ -279,97 +358,134 @@ class EncoderSelector(BaseAgent):
         has_target: bool,
         problem_type: Optional[str],
         ordinal_maps: Dict[str, List[str]]
-    ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[str], Optional[int]]:
         selection: Dict[str, Dict[str, Any]] = {}
         recommendations: List[str] = []
+        est_ohe_total = 0
 
         for col, st in stats.items():
             n_unique = st["n_unique"]
             high_card = st["high_cardinality"]
             missing_pct = st["missing_pct"]
 
-            # 1) jeśli user podał mapowanie porządkowe → OrdinalEncoder (stabilny)
+            # 0) User-provided ordinal
             if col in ordinal_maps and ordinal_maps[col]:
                 selection[col] = {
                     "encoder": "OrdinalEncoder",
-                    "params": {"categories": [ordinal_maps[col]], "handle_unknown": "use_encoded_value", "unknown_value": -1},
+                    "params": {
+                        "categories": [ordinal_maps[col]],
+                        "handle_unknown": "use_encoded_value",
+                        "unknown_value": -1
+                    },
                     "with_rare_grouper": True,
+                    "with_missing_constant": self.policy.add_missing_token,
                     "reason": "User-defined ordinal mapping"
                 }
                 continue
 
-            # 2) Niska krotność → OneHot (bezpieczny, explainable)
+            # 1) Low cardinality → OneHot (explainable)
             if n_unique <= self.policy.max_ohe_unique and not high_card:
+                est_after_rare = self._estimate_ohe_width(st["value_counts"], self.policy.rare_min_pct)
+                est_ohe_total += est_after_rare
                 selection[col] = {
                     "encoder": "OneHotEncoder",
                     "params": {"handle_unknown": "ignore", "drop": "if_binary", "sparse_output": False},
                     "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
+                    "with_missing_constant": self.policy.add_missing_token,
                     "reason": f"Low cardinality ({n_unique} <= {self.policy.max_ohe_unique})"
                 }
                 continue
 
-            # 3) Wysoka / średnia krotność
+            # 2) High/medium cardinality (priorytet: target-based/accuracy)
             if self._ce_available and has_target and strategy in {"auto", "accurate"}:
-                # Preferencje wg typu problemu
-                if problem_type == "regression":
-                    if self.policy.enable_leave_one_out:
-                        selection[col] = {
-                            "encoder": "LeaveOneOutEncoder",
-                            "params": {"random_state": self.policy.random_state},
-                            "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
-                            "reason": "High cardinality with target; regression → LeaveOneOutEncoder"
-                        }
-                    else:
-                        selection[col] = {
-                            "encoder": "TargetEncoder",
-                            "params": {"random_state": self.policy.random_state},
-                            "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
-                            "reason": "High cardinality with target; fallback TargetEncoder"
-                        }
+                if problem_type == "regression" and self.policy.enable_leave_one_out:
+                    selection[col] = {
+                        "encoder": "LeaveOneOutEncoder",
+                        "params": {"random_state": self.policy.random_state},
+                        "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
+                        "with_missing_constant": self.policy.add_missing_token,
+                        "reason": "High cardinality + target; regression → LeaveOneOutEncoder"
+                    }
+                elif self.policy.enable_catboost_encoder and problem_type != "regression":
+                    selection[col] = {
+                        "encoder": "CatBoostEncoder",
+                        "params": {"random_state": self.policy.random_state},
+                        "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
+                        "with_missing_constant": self.policy.add_missing_token,
+                        "reason": "High cardinality + target; classification → CatBoostEncoder"
+                    }
+                elif self.policy.enable_target_encoder:
+                    selection[col] = {
+                        "encoder": "TargetEncoder",
+                        "params": {"random_state": self.policy.random_state},
+                        "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
+                        "with_missing_constant": self.policy.add_missing_token,
+                        "reason": "High cardinality + target; TargetEncoder fallback"
+                    }
                 else:
-                    # classification
-                    if self.policy.enable_catboost_encoder:
-                        selection[col] = {
-                            "encoder": "CatBoostEncoder",
-                            "params": {"random_state": self.policy.random_state},
-                            "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
-                            "reason": "High cardinality with target; classification → CatBoostEncoder"
-                        }
-                    else:
-                        selection[col] = {
-                            "encoder": "TargetEncoder",
-                            "params": {"random_state": self.policy.random_state},
-                            "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
-                            "reason": "High cardinality with target; fallback TargetEncoder"
-                        }
+                    selection[col] = {
+                        "encoder": "OrdinalEncoder",
+                        "params": {"handle_unknown": "use_encoded_value", "unknown_value": -1},
+                        "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
+                        "with_missing_constant": self.policy.add_missing_token,
+                        "reason": "Fallback (no target encoders enabled)"
+                    }
             elif self._ce_available and strategy == "accurate" and self.policy.enable_count_encoder:
-                # Bez targetu → CountEncoder jako informatywny skrót
+                # Bez targetu → CountEncoder (informacyjny skrót)
                 selection[col] = {
                     "encoder": "CountEncoder",
                     "params": {},
                     "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
+                    "with_missing_constant": self.policy.add_missing_token,
                     "reason": "High/medium cardinality without target → CountEncoder"
                 }
+            elif self._ce_available and self.policy.enable_hashing_encoder:
+                # HashingEncoder — bezpieczny przy ekstremalnej krotności
+                selection[col] = {
+                    "encoder": "HashingEncoder",
+                    "params": {"n_components": 16, "max_process": 1, "random_state": self.policy.random_state},
+                    "with_rare_grouper": False,  # hashing jest odporny
+                    "with_missing_constant": self.policy.add_missing_token,
+                    "reason": "Extreme cardinality → HashingEncoder"
+                }
             else:
-                # Fallback bez ce: Ordinal z rare/unk; stabilny i szybki
+                # Fallback bez category_encoders: Ordinal + rare/unk
                 selection[col] = {
                     "encoder": "OrdinalEncoder",
                     "params": {"handle_unknown": "use_encoded_value", "unknown_value": -1},
                     "with_rare_grouper": (self.policy.rare_min_pct > 0.0),
-                    "reason": "Fallback (no category_encoders or no target)"
+                    "with_missing_constant": self.policy.add_missing_token,
+                    "reason": "Fallback (no category_encoders or strategy=fast)"
                 }
 
             # Rekomendacje operacyjne
             if high_card and not self._ce_available and has_target:
                 recommendations.append(
-                    f"Zainstaluj 'category_encoders' aby użyć Target/LOO/CatBoost dla kolumny '{col}' (aktualnie fallback Ordinal)."
+                    f"Zainstaluj 'category_encoders' aby użyć Target/LOO/CatBoost dla kolumny '{col}' (aktualnie Ordinal/rare/unk)."
                 )
             if missing_pct > 10.0:
                 recommendations.append(
                     f"Kolumna '{col}' ma {missing_pct:.1f}% braków — rozważ uzupełnienie upstream lub dedykowany token '<MISSING>'."
                 )
 
-        return selection, sorted(set(recommendations))
+        return selection, sorted(set(recommendations)), (est_ohe_total if est_ohe_total > 0 else None)
+
+    def _estimate_ohe_width(self, value_counts: pd.Series, rare_min_pct: float) -> int:
+        """Szacuje liczbę kolumn po OHE po zgrupowaniu rzadkich wartości do <RARE> i z uwzględnieniem '<MISSING>'."""
+        n = int(value_counts.sum())
+        vc = value_counts.copy()
+        # Na wypadek, gdy w index jest NaN jako klucz
+        null_count = int(vc.get(np.nan, 0)) if vc.index.dtype != object else 0
+        # Zastąp NaN jawnie jako '<MISSING>' do estymacji (jeśli polityka tak mówi)
+        if self.policy.add_missing_token and null_count > 0:
+            vc = vc.drop(labels=[np.nan], errors="ignore")
+            vc[self.policy.missing_token] = vc.get(self.policy.missing_token, 0) + null_count
+
+        pct = vc / max(1, n)
+        keep = pct[pct >= rare_min_pct]
+        rare_bucket = (pct < rare_min_pct).sum()
+        # OHE: liczba utrzymanych kategorii + 1 (dla <RARE> jeśli występują)
+        return int(len(keep) + (1 if rare_bucket > 0 else 0))
 
     # === BUDOWA TRANSFORMERA ===
     def _build_transformer(
@@ -385,27 +501,34 @@ class EncoderSelector(BaseAgent):
         # NUMERIC
         if num_cols and self.policy.passthrough_numeric:
             num_pipe = Pipeline(steps=[
-                ("imputer", SimpleImputer(strategy=self.policy.impute_strategy_numeric)),
+                ("imputer", SimpleImputer(
+                    strategy=self.policy.impute_strategy_numeric,
+                    fill_value=np.nan if self.policy.impute_strategy_numeric != "constant" else 0.0
+                )),
             ])
             transformers.append(("num", num_pipe, num_cols))
 
-        # CATEGORICAL — per kolumna
+        # CATEGORICAL — per kolumna (czytelne mapowanie i pełna kontrola)
         for col, spec in selection.items():
             steps: List[Tuple[str, Any]] = []
-            # imputacja + grupowanie rzadkich
-            steps.append(("imputer", SimpleImputer(strategy=self.policy.impute_strategy_categorical)))
 
-            if spec.get("with_rare_grouper", False):
+            # imputacja braków
+            if spec.get("with_missing_constant", False) and self.policy.impute_strategy_categorical == "constant":
+                steps.append(("imputer", SimpleImputer(strategy="constant", fill_value=self.policy.missing_token)))
+            else:
+                steps.append(("imputer", SimpleImputer(strategy=self.policy.impute_strategy_categorical)))
+
+            # rare/unk
+            if spec.get("with_rare_grouper", False) and self.policy.rare_min_pct > 0:
                 steps.append(("rare", RareCategoryGrouper(
                     min_pct=self.policy.rare_min_pct,
                     rare_token=self.policy.rare_token,
                     unk_token=self.policy.handle_unknown_token
                 )))
 
+            # właściwy encoder
             encoder_name = spec["encoder"]
             params = spec.get("params", {})
-
-            # Skonstruuj enkoder
             enc = self._make_encoder(encoder_name, params)
 
             steps.append(("encoder", enc))
@@ -421,7 +544,6 @@ class EncoderSelector(BaseAgent):
             try:
                 return OneHotEncoder(**params)
             except TypeError:
-                # starsze sklearn używa 'sparse'
                 params2 = params.copy()
                 if "sparse_output" in params2:
                     sp = params2.pop("sparse_output")
@@ -444,15 +566,18 @@ class EncoderSelector(BaseAgent):
         if name == "CatBoostEncoder":
             return ce.CatBoostEncoder(**params)
         if name == "CountEncoder":
+            # CountEncoder może zwracać 2 kolumny (count & ratio) zależnie od wersji;
+            # w typowym użyciu domyślnym — jedna kolumna z licznością.
             return ce.CountEncoder(**params)
+        if name == "HashingEncoder":
+            return ce.HashingEncoder(**params)
 
-        # domyślnie
+        # domyślne zabezpieczenie
         return OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
 
     # === NAZWY CECH ===
     def _safe_feature_names(self, transformer: ColumnTransformer, input_features: List[str]) -> Optional[List[str]]:
         try:
-            # sklearn >= 1.0
             names = list(transformer.get_feature_names_out(input_features))
             return names
         except Exception:

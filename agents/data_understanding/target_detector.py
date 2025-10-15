@@ -3,46 +3,71 @@
 DataGenius PRO - Target Detector (PRO+++)
 Automatycznie wykrywa kolumnę celu (target) łącząc priorytet użytkownika, LLM i heurystyki.
 Zaprojektowany defensywnie, z trybem offline, progami pewności i spójnym kontraktem danych.
+
+Kontrakt (AgentResult.data):
+{
+  "target_column": Optional[str],
+  "problem_type": Optional[str],            # "classification" | "regression"
+  "detection_method": "user_specified" | "llm_detected" | "heuristic" | "failed",
+  "confidence": float,                      # 0..1
+  "target_info": Dict[str, Any]             # statystyki/wartości rozkładu
+}
 """
 
-# === IMPORTY ===
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Iterable
+import time
+import json
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
 from core.base_agent import BaseAgent, AgentResult
 from core.llm_client import get_llm_client
 from core.utils import infer_problem_type
+from config.model_registry import ProblemType
 
 
-# === KONFIG / PROGI ===
+# === NAZWA_SEKCJI === KONFIG / PROGI ===
 @dataclass(frozen=True)
 class TargetDetectorConfig:
     """Progi i zachowanie detektora."""
-    llm_min_confidence: float = 0.65          # minimalna akceptowalna pewność z LLM
-    llm_timeout_sec: float = 30.0             # jeśli dotyczy w kliencie LLM
+    llm_min_confidence: float = 0.65           # minimalna akceptowalna pewność z LLM
+    llm_timeout_sec: float = 30.0              # (jeśli dotyczy w kliencie LLM)
     heuristic_default_confidence: float = 0.70
-    heuristic_fallback_confidence: float = 0.50
+    heuristic_fallback_confidence: float = 0.55
     # słowa-klucze sugerujące target
     target_keywords: Tuple[str, ...] = (
-        "target", "label", "class", "outcome", "result",
-        "price", "sales", "revenue", "churn", "fraud",
-        "risk", "score", "rating", "survived", "default",
-        "y", "y_true", "y_label"
+        "target","label","class","outcome","result",
+        "price","sales","revenue","churn","fraud",
+        "risk","score","rating","survived","default",
+        "y","y_true","y_label","response","conversion","clicked","amount"
     )
-    # semantyki, których nie wybieramy jako target
-    forbidden_semantics: Tuple[str, ...] = ("id", "uuid", "guid", "timestamp", "datetime", "text")
+    # semantyki i nazwy, których nie wybieramy jako target
+    forbidden_semantics: Tuple[str, ...] = ("id","uuid","guid","timestamp","datetime","text","free_text")
+    forbidden_name_substrings: Tuple[str, ...] = ("id","uuid","guid","ts","time","stamp")
+    # wagi rankingu heurystycznego
+    w_name_keyword: float = 0.40
+    w_semantic: float = 0.20
+    w_dtype: float = 0.10
+    w_missing: float = 0.10
+    w_uniqueness: float = 0.10
+    w_position_hint: float = 0.10
+    # progi/definicje pomocnicze
+    id_like_unique_ratio: float = 0.98        # ~98%+ unikalnych → ID-like (kara)
+    high_missing_ratio_flag: float = 0.30     # >30% braków → kara
+    max_llm_reason_len: int = 600             # limit uzasadnienia z LLM (log/przechowywanie)
+    truncate_log_chars: int = 500             # cięcie długich struktur w logach
 
 
-# === KLASA GŁÓWNA AGENDA ===
+# === NAZWA_SEKCJI === KLASA GŁÓWNA AGENDA ===
 class TargetDetector(BaseAgent):
     """
     Detects target column using LLM-powered analysis with safe fallbacks.
-    Priorytet: user_target > LLM (z progiem) > heurystyki.
+    Priorytet: user_target > LLM (z progiem) > ranking heurystyczny.
     """
 
     def __init__(self, config: Optional[TargetDetectorConfig] = None) -> None:
@@ -51,12 +76,12 @@ class TargetDetector(BaseAgent):
             description="Automatically detects target column for ML"
         )
         self.config = config or TargetDetectorConfig()
-        # llm_client może być None (brak klucza / tryb offline)
         self.llm_client = self._safe_get_llm_client()
+        self._log = logger.bind(agent="TargetDetector")
 
-    # === WALIDACJA WEJŚCIA ===
+    # === NAZWA_SEKCJI === WALIDACJA WEJŚCIA ===
     def validate_input(self, **kwargs) -> bool:
-        """Validate input parameters"""
+        """Validate input parameters (bez twardego fail na pustym DF — zwrócimy kontrakt failed)."""
         if "data" not in kwargs:
             raise ValueError("'data' parameter is required")
         if "column_info" not in kwargs:
@@ -65,8 +90,6 @@ class TargetDetector(BaseAgent):
         df = kwargs["data"]
         if not isinstance(df, pd.DataFrame):
             raise TypeError("'data' must be a pandas DataFrame")
-        if df.empty:
-            raise ValueError("DataFrame is empty")
 
         ci = kwargs["column_info"]
         if not isinstance(ci, list):
@@ -74,7 +97,7 @@ class TargetDetector(BaseAgent):
 
         return True
 
-    # === GŁÓWNE WYKONANIE ===
+    # === NAZWA_SEKCJI === GŁÓWNE WYKONANIE ===
     def execute(
         self,
         data: pd.DataFrame,
@@ -84,143 +107,134 @@ class TargetDetector(BaseAgent):
     ) -> AgentResult:
         """
         Detect target column.
-
-        Args:
-            data: Input DataFrame
-            column_info: Column information from SchemaAnalyzer
-            user_target: User-specified target (takes priority)
-
-        Returns:
-            AgentResult with detection payload
         """
         result = AgentResult(agent_name=self.name)
-
         try:
+            if data is None or data.empty or len(data.columns) == 0:
+                self._log.warning("empty DataFrame or no columns — cannot detect target.")
+                result.data = {"target_column": None, "problem_type": None,
+                               "detection_method": "failed", "confidence": 0.0}
+                result.add_warning("Empty DataFrame — cannot detect target")
+                return result
+
             # 0) Priorytet użytkownika
             if user_target:
                 chosen = self._match_column_name(user_target, data.columns.tolist())
                 if chosen is not None:
-                    payload = self._build_payload(
-                        df=data,
-                        target_col=chosen,
-                        method="user_specified",
-                        confidence=1.0
+                    result.data = self._build_payload(
+                        df=data, target_col=chosen, method="user_specified", confidence=1.0
                     )
-                    result.data = payload
-                    logger.success(f"Target selected by user: '{chosen}'")
+                    self._log.success(f"user target selected: '{chosen}'")
                     return result
                 else:
-                    result.add_warning(
-                        f"User-specified target '{user_target}' not found. Falling back to auto-detection."
-                    )
+                    result.add_warning(f"User-specified target '{user_target}' not found. Falling back to auto-detection.")
 
-            # 1) LLM (jeśli dostępny)
+            # 1) LLM (opcjonalnie)
             target_col, confidence = None, 0.0
             if self.llm_client is not None:
                 target_col, confidence = self._detect_with_llm(data, column_info)
 
-            # Akceptujemy LLM tylko powyżej progu i gdy istnieje w danych
             if target_col and confidence >= self.config.llm_min_confidence and target_col in data.columns:
-                payload = self._build_payload(
-                    df=data,
-                    target_col=target_col,
-                    method="llm_detected",
-                    confidence=float(confidence)
+                result.data = self._build_payload(
+                    df=data, target_col=target_col, method="llm_detected", confidence=float(confidence)
                 )
-                result.data = payload
-                logger.success(f"LLM detected target: '{target_col}' (confidence={confidence:.2f})")
+                self._log.success(f"LLM detected target: '{target_col}' (conf={confidence:.2f})")
                 return result
 
-            # 2) Heurystyka
-            h_col, h_conf = self._heuristic_detection(data, column_info)
-            if h_col:
-                payload = self._build_payload(
-                    df=data,
-                    target_col=h_col,
-                    method="heuristic",
-                    confidence=h_conf
+            # 2) Heurystyki — ranking kandydatów
+            cand = self._heuristic_ranked_detection(data, column_info)
+            if cand is not None:
+                name, score = cand
+                conf = max(self.config.heuristic_fallback_confidence, min(0.95, score))
+                result.data = self._build_payload(
+                    df=data, target_col=name, method="heuristic", confidence=conf
                 )
-                result.data = payload
-                logger.success(f"Heuristic detected target: '{h_col}' (confidence={h_conf:.2f})")
+                self._log.success(f"Heuristic detected target: '{name}' (score={score:.3f})")
                 return result
 
             # 3) Brak sukcesu
             result.add_warning("Could not detect target column")
-            result.data = {
-                "target_column": None,
-                "problem_type": None,
-                "detection_method": "failed",
-                "confidence": 0.0
-            }
+            result.data = {"target_column": None, "problem_type": None,
+                           "detection_method": "failed", "confidence": 0.0}
 
         except Exception as e:
             result.add_error(f"Target detection failed: {e}")
-            logger.exception(f"Target detection error: {e}")
+            self._log.exception(f"Target detection error: {e}")
 
         return result
 
-    # === BUDOWA PAYLOADU ===
+    # === NAZWA_SEKCJI === BUDOWA PAYLOADU ===
     def _build_payload(self, df: pd.DataFrame, target_col: str, method: str, confidence: float) -> Dict[str, Any]:
         """Składa wynikowy kontrakt danych."""
-        problem_type = infer_problem_type(df[target_col])
+        try:
+            detected = infer_problem_type(df[target_col])
+            if isinstance(detected, ProblemType):
+                problem_type = "classification" if detected == ProblemType.CLASSIFICATION else "regression"
+            else:
+                problem_type = str(detected).lower().strip()
+        except Exception:
+            problem_type = None
+
         return {
             "target_column": target_col,
-            "problem_type": str(problem_type),
+            "problem_type": problem_type,
             "detection_method": method,
             "confidence": float(max(0.0, min(1.0, confidence))),
             "target_info": self._get_target_info(df[target_col]),
         }
 
-    # === LLM DETEKCJA ===
-    def _detect_with_llm(
-        self,
-        df: pd.DataFrame,
-        column_info: List[Dict]
-    ) -> Tuple[Optional[str], float]:
+    # === NAZWA_SEKCJI === LLM DETEKCJA (Z WALIDACJĄ JSON) ===
+    def _detect_with_llm(self, df: pd.DataFrame, column_info: List[Dict]) -> Tuple[Optional[str], float]:
         """
-        Use LLM to detect target column (strict JSON).
-        Returns (column_name or None, confidence).
+        Używa LLM do detekcji targetu. Akceptuje TYLKO poprawny JSON i istniejącą nazwę kolumny.
+        Zwraca (column_name|None, confidence).
         """
         prompt = self._build_llm_prompt(column_info)
-
         try:
-            response = self.llm_client.generate_json(prompt)
+            resp = self.llm_client.generate_json(prompt, timeout=self.config.llm_timeout_sec)
         except Exception as e:
-            logger.warning(f"LLM call failed, switching to heuristics: {e}")
+            self._log.warning(f"LLM call failed, switching to heuristics: {e}")
             return None, 0.0
 
-        # Oczekujemy: {"target_column": "...", "reasoning": "...", "confidence": 0.0-1.0}
-        target_column = response.get("target_column")
-        confidence = float(response.get("confidence", 0.0) or 0.0)
+        # walidacja minimalna
+        if not isinstance(resp, dict):
+            self._log.warning("LLM returned non-dict JSON.")
+            return None, 0.0
 
-        # Dopasowanie nazwy do istniejących kolumn (case-insensitive)
-        matched = self._match_column_name(target_column, df.columns.tolist()) if target_column else None
+        target_column = resp.get("target_column")
+        confidence = resp.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+
+        matched = self._match_column_name(target_column, df.columns.tolist()) if isinstance(target_column, str) else None
         if matched is None:
-            logger.warning(f"LLM suggested invalid column: {target_column}")
+            self._log.warning(f"LLM suggested invalid column: {target_column}")
             return None, 0.0
 
-        logger.info(
-            f"LLM suggestion: {matched} (confidence: {confidence:.2f})"
-        )
+        reasoning = resp.get("reasoning", "")
+        if isinstance(reasoning, str) and len(reasoning) > self.config.max_llm_reason_len:
+            reasoning = reasoning[: self.config.max_llm_reason_len] + "...(truncated)"
+        self._log.info(f"LLM suggestion: {matched} (conf={confidence:.2f}); reason={reasoning}")
+
         return matched, confidence
 
     def _build_llm_prompt(self, column_info: List[Dict]) -> str:
-        """Kompaktowy, jednoznaczny prompt z wymuszonym JSON-em."""
+        """Kompaktowy prompt z wymuszonym JSON-em (bezpieczny dla modeli)."""
         columns_description = self._format_columns_for_llm(column_info)
         return f"""
 Analizujesz dataset z następującymi kolumnami:
-
 {columns_description}
 
 ZADANIE: wskaż najbardziej prawdopodobną kolumnę docelową (target) do przewidywania.
 
 ZASADY WYBORU:
-1) Kolumna, którą przewidujemy na bazie innych.
-2) Nazwa często zawiera: target, label, class, outcome, result, price, sales, churn, revenue, score, rating itp.
-3) Semantycznie jest to wynik/cel analizy (np. cena, sprzedaż, czy klient odszedł).
-4) NIE wybieraj: ID/UUID/GUID, timestamp, czysty tekst opisowy.
+1) Kolumna to wynik/cel analizy (np. cena, sprzedaż, churn).
+2) Nazwa może zawierać: target, label, class, outcome, result, price, sales, revenue, churn, risk, score, rating, survived, default, y, response, clicked, amount.
+3) NIE wybieraj: ID/UUID/GUID, timstamps, czysty tekst opisowy (długie opisy), pola wskaźnikowe pomocnicze.
 
-FORMAT ODPOWIEDZI (TYLKO JSON, BEZ DODATKOWEGO TEKSTU):
+FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
 {{
   "target_column": "nazwa_kolumny" | null,
   "reasoning": "krótkie uzasadnienie po polsku",
@@ -228,40 +242,6 @@ FORMAT ODPOWIEDZI (TYLKO JSON, BEZ DODATKOWEGO TEKSTU):
 }}
 """.strip()
 
-    # === HEURYSTYKA ===
-    def _heuristic_detection(
-        self,
-        df: pd.DataFrame,
-        column_info: List[Dict]
-    ) -> Tuple[Optional[str], float]:
-        """
-        Heurystyczna detekcja targetu:
-        1) nazwa zawiera słowo-klucz,
-        2) semantyka nie jest zabroniona (id/timestamp/text),
-        3) fallback: ostatnia kolumna, która nie wygląda na ID/timestamp/text.
-        """
-        # 1) słowa-klucze
-        for c in column_info:
-            name = str(c.get("name", ""))
-            sem = str(c.get("semantic_type", "") or "").lower()
-            if self._is_forbidden_semantics(sem):
-                continue
-            low = name.lower()
-            if any(k in low for k in self.config.target_keywords):
-                return name, self.config.heuristic_default_confidence
-
-        # 2) fallback – ostatnia sensowna kolumna
-        for c in reversed(column_info):
-            name = str(c.get("name", ""))
-            sem = str(c.get("semantic_type", "") or "").lower()
-            if self._is_forbidden_semantics(sem):
-                continue
-            if name in df.columns:
-                return name, self.config.heuristic_fallback_confidence
-
-        return None, 0.0
-
-    # === POMOCNICZE ===
     def _format_columns_for_llm(self, column_info: List[Dict]) -> str:
         """Formatuje metadane kolumn do promptu LLM (zwięźle, stabilnie)."""
         lines: List[str] = []
@@ -271,21 +251,104 @@ FORMAT ODPOWIEDZI (TYLKO JSON, BEZ DODATKOWEGO TEKSTU):
             sem  = str(col.get("semantic_type", "") or "")
             nuni = int(col.get("n_unique", 0))
             miss = float(col.get("missing_pct", 0.0))
-
             line = f"- {name}: dtype={dtype}; sem={sem}; unique={nuni}; missing_pct={miss:.1f}"
-            # Nie zakładamy obecności 'mean'/'mode' na root, bo w SchemaAnalyzer są w 'extras'
-            extras = col.get("extras", {})
-            if isinstance(extras, dict):
-                if extras.get("mode") is not None:
-                    line += f"; mode={extras.get('mode')}"
-                if extras.get("mean") is not None:
-                    try:
-                        line += f"; mean={float(extras.get('mean')):.3f}"
-                    except Exception:
-                        pass
             lines.append(line)
         return "\n".join(lines)
 
+    # === NAZWA_SEKCJI === HEURYSTYKI I RANKING ===
+    def _heuristic_ranked_detection(self, df: pd.DataFrame, column_info: List[Dict]) -> Optional[Tuple[str, float]]:
+        """
+        Buduje ranking kandydatów z wagami:
+          * nazwa (słowa-klucze + penalizacja forbidden_name_substrings),
+          * semantyka (bonus: outcome; kara: id/timestamp/text),
+          * dtype (bonus: numeric/object; kara: datetimes),
+          * braki (kara za > high_missing_ratio_flag),
+          * unikatowość (kara za ID-like),
+          * pozycja (lekki bonus dla ostatniej kolumny).
+        Zwraca (nazwa, score 0..1) lub None.
+        """
+        if not column_info:
+            # fallback: ostatnia kolumna, jeśli istnieje
+            if len(df.columns):
+                return df.columns[-1], self.config.heuristic_fallback_confidence
+            return None
+
+        cfg = self.config
+        candidates: List[Tuple[str, float, Dict[str, Any]]] = []
+
+        for idx, col in enumerate(column_info):
+            name = str(col.get("name", ""))
+            if name not in df.columns:  # sanity
+                continue
+
+            dtype = str(col.get("dtype", "")).lower()
+            sem = str(col.get("semantic_type", "") or "").lower()
+            nuni = int(col.get("n_unique", 0))
+            miss_pct = float(col.get("missing_pct", 0.0)) / 100.0
+            n = max(1, len(df))
+            unique_ratio = (nuni / n)
+
+            # 1) Nazwa — słowa-klucze / forbidden substrings
+            lname = name.lower()
+            name_score = 1.0 if any(k in lname for k in cfg.target_keywords) else 0.0
+            if any(bad in lname for bad in cfg.forbidden_name_substrings):
+                name_score -= 0.6  # mocna kara
+            name_score = max(0.0, min(1.0, name_score))
+
+            # 2) Semantyka
+            if self._is_forbidden_semantics(sem):
+                sem_score = 0.0
+            else:
+                # lekki bonus gdy semantyka typu outcome/score/rating
+                if any(x in sem for x in ("outcome","result","score","rating","target","label","class")):
+                    sem_score = 1.0
+                else:
+                    sem_score = 0.5  # neutralny bonus, jeśli nie zabronione
+
+            # 3) Dtype
+            if "datetime" in dtype or "datetimetz" in dtype:
+                dtype_score = 0.0
+            elif "bool" in dtype:
+                dtype_score = 0.5
+            else:
+                dtype_score = 0.8  # numeric/object/category — neutralnie dodatnie
+
+            # 4) Braki
+            missing_penalty = 0.0
+            if miss_pct > cfg.high_missing_ratio_flag:
+                missing_penalty = 0.6
+
+            # 5) Unikatowość (ID-like kara)
+            unique_penalty = 0.6 if unique_ratio >= cfg.id_like_unique_ratio else 0.0
+
+            # 6) Pozycja — lekki bonus dla ostatniej kolumny
+            position_bonus = 1.0 if name == df.columns[-1] else 0.0
+
+            # Składanie wyniku 0..1
+            raw = (
+                cfg.w_name_keyword * name_score +
+                cfg.w_semantic * sem_score +
+                cfg.w_dtype * dtype_score +
+                cfg.w_position_hint * position_bonus
+            )
+            penalty = (cfg.w_missing * missing_penalty) + (cfg.w_uniqueness * unique_penalty)
+            score = max(0.0, min(1.0, raw - penalty))
+
+            candidates.append((name, score, {"name_score": name_score, "sem_score": sem_score,
+                                             "dtype_score": dtype_score, "missing_penalty": missing_penalty,
+                                             "unique_penalty": unique_penalty, "position_bonus": position_bonus}))
+
+        if not candidates:
+            return None
+
+        # sort po score, potem po mniejszym missing%, potem po większym name_score
+        candidates.sort(key=lambda x: (x[1], -float(next((c.get("missing_penalty", 0.0) for c in [x[2]]), 0.0)),
+                                       x[2].get("name_score", 0.0)), reverse=True)
+        best_name, best_score, dbg = candidates[0]
+        self._log.info(f"heuristic candidates top: {best_name} (score={best_score:.3f}, dbg={self._truncate(dbg)})")
+        return best_name, best_score
+
+    # === NAZWA_SEKCJI === POMOCNICZE ===
     def _get_target_info(self, target: pd.Series) -> Dict[str, Any]:
         """Get detailed information about target column (defensywnie)."""
         n = max(1, len(target))
@@ -296,7 +359,6 @@ FORMAT ODPOWIEDZI (TYLKO JSON, BEZ DODATKOWEGO TEKSTU):
             "missing_pct": float((target.isna().sum() / n) * 100),
         }
 
-        # Numeryczne
         if pd.api.types.is_numeric_dtype(target):
             t = pd.to_numeric(target, errors="coerce").dropna()
             if t.empty:
@@ -321,17 +383,14 @@ FORMAT ODPOWIEDZI (TYLKO JSON, BEZ DODATKOWEGO TEKSTU):
         if not candidate:
             return None
         low = candidate.strip().lower()
-        # try exact
-        for c in columns:
+        for c in columns:                       # exact
             if c == candidate:
                 return c
-        # try lowercased
-        for c in columns:
+        for c in columns:                       # lower
             if c.lower() == low:
                 return c
-        # try relaxed (usunięcie spacji/podkreśleń)
         relaxed = low.replace("_", "").replace(" ", "")
-        for c in columns:
+        for c in columns:                       # relaxed
             if c.lower().replace("_", "").replace(" ", "") == relaxed:
                 return c
         return None
@@ -347,3 +406,11 @@ FORMAT ODPOWIEDZI (TYLKO JSON, BEZ DODATKOWEGO TEKSTU):
         except Exception as e:
             logger.warning(f"LLM client unavailable; running in offline mode. Reason: {e}")
             return None
+
+    @staticmethod
+    def _truncate(obj: Any, limit: int = 400) -> str:
+        try:
+            s = json.dumps(obj, ensure_ascii=False, default=str)
+        except Exception:
+            s = str(obj)
+        return s if len(s) <= limit else s[:limit] + f"...(+{len(s)-limit} chars)"

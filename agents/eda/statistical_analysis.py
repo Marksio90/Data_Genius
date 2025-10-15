@@ -1,15 +1,63 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Statistical Analyzer (PRO+++)
+DataGenius PRO - Statistical Analyzer (PRO++++)
 Kompleksowa analiza statystyczna: metryki globalne, cechy numeryczne/kategoryczne,
-analiza rozkładów i zwięzłe rekomendacje dla EDA / modelowania.
+analiza rozkładów i zwięzłe rekomendacje dla EDA/modelowania + telemetry.
+
+Kontrakt (AgentResult.data):
+{
+  "overall": {"n_rows": int, "n_columns": int, "n_numeric": int, "n_categorical": int,
+              "memory_mb": float, "sparsity": float},
+  "numeric_features": {
+      "n_features": int,
+      "features": {
+          "<col>": {
+              "count": int, "mean": float, "std": float, "min": float, "q01": float, "q25": float,
+              "median": float, "q75": float, "q99": float, "max": float, "skewness": float,
+              "kurtosis": float, "variance": float, "range": float, "iqr": float, "cv": float|None,
+              "zero_variance": bool, "near_constant": bool, "monotonic": "increasing"|"decreasing"|None
+          }, ...
+      },
+      "summary": {
+          "highest_variance": str|None, "lowest_variance": str|None, "avg_skewness": float,
+          "zero_variance_features": List[str], "near_constant_features": List[str],
+          "high_cv_features": List[str]
+      }
+  },
+  "categorical_features": {
+      "n_features": int,
+      "features": {
+          "<col>": {
+              "count": int, "n_unique": int, "mode": str|None, "mode_frequency": int,
+              "mode_percentage": float, "top_k_values": Dict[str,int], "is_binary": bool,
+              "cardinality": "high"|"low"|"medium", "majority_share": float
+          }, ...
+      },
+      "summary": {"high_cardinality_features": List[str], "dominant_classes_features": List[str]}
+  },
+  "distributions": {
+      "<col>": {
+          "distribution_type": "normal"|"symmetric"|"right_skewed"|"left_skewed",
+          "is_normal": bool|None, "normality_test": "shapiro"|"dagostino"|"anderson"|None,
+          "p_value": float|None, "skewness": float, "kurtosis": float,
+          "has_outliers": bool, "heavy_tails": bool, "high_skewness": bool
+      }, ...
+  },
+  "recommendations": List[str],
+  "summary": {
+      "n_zero_variance": int, "n_near_constant": int, "n_high_cv": int,
+      "n_high_cardinality": int, "n_dominant_categorical": int
+  },
+  "telemetry": {"elapsed_ms": float, "timings_ms": {"overall": float, "numeric": float, "categorical": float, "distributions": float},
+                "sampled_for_tests": bool, "sample_info": {"from_rows": int, "to_rows": int}|None}
+}
 """
 
-# === IMPORTY ===
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,77 +67,86 @@ from scipy import stats
 from core.base_agent import BaseAgent, AgentResult
 
 
-# === KONFIG / PROGI HEURYSTYCZNE ===
+# === NAZWA_SEKCJI === KONFIG / PROGI HEURYSTYCZNE ===
 @dataclass(frozen=True)
 class StatsConfig:
     normality_alpha: float = 0.05           # próg istotności dla testów normalności
     max_shapiro_n: int = 5_000              # Shapiro tylko do tej liczby obserwacji
-    high_cardinality_threshold: int = 50    # >50 unikatów → high cardinality (kategorie)
+    high_cardinality_threshold: int = 50    # >50 unikatów → high cardinality
     skew_high_abs: float = 1.0              # |skew| > 1 → silna skośność
     kurt_high_abs: float = 3.0              # |excess kurtosis| > 3 → ciężkie ogony
     cv_warn: float = 1.0                    # CV > 1 → duża zmienność (poza zero mean)
-    top_k_values: int = 5                   # ile top wartości zwracać dla kategorii
+    top_k_values: int = 5                   # ile top wartości dla kategorii
+    near_constant_ratio: float = 0.98       # >=98% tej samej wartości → near-constant
+    max_rows_for_tests: int = 300_000       # sampling safety dla testów normalności
+    random_state: int = 42
 
 
-# === KLASA GŁÓWNA ===
+# === NAZWA_SEKCJI === KLASA GŁÓWNA ===
 class StatisticalAnalyzer(BaseAgent):
     """
-    Comprehensive statistical analysis agent.
+    Comprehensive statistical analysis agent (PRO++++): defensywnie, szybko, ze spójnym kontraktem i telemetry.
     """
 
     def __init__(self, config: Optional[StatsConfig] = None) -> None:
-        super().__init__(
-            name="StatisticalAnalyzer",
-            description="Comprehensive statistical analysis of dataset"
-        )
+        super().__init__(name="StatisticalAnalyzer", description="Comprehensive statistical analysis of dataset")
         self.config = config or StatsConfig()
+        self._log = logger.bind(agent="StatisticalAnalyzer")
 
-    # === WYKONANIE GŁÓWNE ===
+    # === NAZWA_SEKCJI === WYKONANIE GŁÓWNE ===
     def execute(self, data: pd.DataFrame, **kwargs) -> AgentResult:
         """
-        Perform statistical analysis.
-
-        Args:
-            data: Input DataFrame
-
-        Returns:
-            AgentResult with statistical analysis
+        Perform statistical analysis with defensive guards and telemetry.
         """
         result = AgentResult(agent_name=self.name)
+        t0_total = time.perf_counter()
 
         try:
             if data is None or not isinstance(data, pd.DataFrame):
                 msg = "StatisticalAnalyzer: 'data' must be a pandas DataFrame."
                 result.add_error(msg)
-                logger.error(msg)
+                self._log.error(msg)
                 return result
 
             if data.empty:
                 result.add_warning("Empty DataFrame — statistical analysis skipped.")
-                result.data = {
-                    "overall": {"n_rows": 0, "n_columns": 0, "n_numeric": 0, "n_categorical": 0,
-                                "memory_mb": 0.0, "sparsity": 0.0},
-                    "numeric_features": {"n_features": 0, "features": {}, "summary": {}},
-                    "categorical_features": {"n_features": 0, "features": {}},
-                    "distributions": {},
-                    "recommendations": ["Dostarcz dane, aby przeprowadzić analizę statystyczną."]
-                }
+                result.data = self._empty_payload()
+                result.data["telemetry"]["elapsed_ms"] = round((time.perf_counter() - t0_total) * 1000, 1)
                 return result
 
-            # 1) Statystyki globalne
-            overall_stats = self._get_overall_statistics(data)
+            df = data.replace([np.inf, -np.inf], np.nan)
 
-            # 2) Numeryczne
-            numeric_stats = self._analyze_numeric_features(data)
+            # 1) Overall
+            t0 = time.perf_counter()
+            overall_stats = self._get_overall_statistics(df)
+            t_overall = (time.perf_counter() - t0) * 1000
 
-            # 3) Kategoryczne
-            categorical_stats = self._analyze_categorical_features(data)
+            # 2) Numeric
+            t0 = time.perf_counter()
+            numeric_stats = self._analyze_numeric_features(df)
+            t_numeric = (time.perf_counter() - t0) * 1000
 
-            # 4) Rozkłady
-            distributions = self._analyze_distributions(data)
+            # 3) Categorical
+            t0 = time.perf_counter()
+            categorical_stats = self._analyze_categorical_features(df)
+            t_categorical = (time.perf_counter() - t0) * 1000
 
-            # 5) Rekomendacje (na podstawie powyższych sekcji)
+            # 4) Distributions (z samplingiem dla bardzo dużych zbiorów)
+            t0 = time.perf_counter()
+            dist_df, sampled, sample_info = self._maybe_sample_for_tests(df)
+            distributions = self._analyze_distributions(dist_df)
+            t_distributions = (time.perf_counter() - t0) * 1000
+
+            # 5) Rekomendacje
             recommendations = self._build_recommendations(numeric_stats, categorical_stats, distributions)
+
+            # 6) Podsumowanie sygnałów
+            zero_vars = (numeric_stats.get("summary", {}) or {}).get("zero_variance_features", []) or []
+            near_const = (numeric_stats.get("summary", {}) or {}).get("near_constant_features", []) or []
+            high_cv = (numeric_stats.get("summary", {}) or {}).get("high_cv_features", []) or []
+            cat_feat = categorical_stats.get("features", {}) or {}
+            high_card = [c for c, v in cat_feat.items() if v.get("cardinality") == "high"]
+            dominant = [c for c, v in cat_feat.items() if v.get("majority_share", 0) > 80.0]
 
             result.data = {
                 "overall": overall_stats,
@@ -97,19 +154,37 @@ class StatisticalAnalyzer(BaseAgent):
                 "categorical_features": categorical_stats,
                 "distributions": distributions,
                 "recommendations": recommendations,
+                "summary": {
+                    "n_zero_variance": int(len(zero_vars)),
+                    "n_near_constant": int(len(near_const)),
+                    "n_high_cv": int(len(high_cv)),
+                    "n_high_cardinality": int(len(high_card)),
+                    "n_dominant_categorical": int(len(dominant)),
+                },
+                "telemetry": {
+                    "elapsed_ms": round((time.perf_counter() - t0_total) * 1000, 1),
+                    "timings_ms": {
+                        "overall": round(t_overall, 1),
+                        "numeric": round(t_numeric, 1),
+                        "categorical": round(t_categorical, 1),
+                        "distributions": round(t_distributions, 1),
+                    },
+                    "sampled_for_tests": bool(sampled),
+                    "sample_info": sample_info
+                }
             }
 
-            logger.success("Statistical analysis completed")
+            self._log.success("Statistical analysis completed")
 
         except Exception as e:
             result.add_error(f"Statistical analysis failed: {e}")
-            logger.exception(f"Statistical analysis error: {e}")
+            self._log.exception(f"Statistical analysis error: {e}")
 
         return result
 
-    # === OVERALL ===
+    # === NAZWA_SEKCJI === OVERALL ===
     def _get_overall_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Get overall dataset statistics (bezpiecznie dla pamięci/NaN)."""
+        """Get overall dataset statistics (NA/Inf-safe)."""
         n_rows = int(len(df))
         n_cols = int(len(df.columns))
         try:
@@ -129,114 +204,180 @@ class StatisticalAnalyzer(BaseAgent):
             "sparsity": sparsity,
         }
 
-    # === NUMERYCZNE ===
+    # === NAZWA_SEKCJI === NUMERYCZNE ===
     def _analyze_numeric_features(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze numeric features (robust, NA-safe)."""
+        """Analyze numeric features (robust, NA-safe, z percentylami i flagami jakości)."""
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         if len(num_cols) == 0:
             return {"n_features": 0, "features": {}, "summary": {"message": "No numeric features found"}}
 
         features_stats: Dict[str, Dict[str, Any]] = {}
+        zero_vars: List[str] = []
+        near_constants: List[str] = []
+        high_cv_cols: List[str] = []
+
         for col in num_cols:
-            s = pd.to_numeric(df[col], errors="coerce").dropna()
-            if s.empty:
+            s = pd.to_numeric(df[col], errors="coerce")
+            s_nona = s.dropna()
+            if s_nona.empty:
                 continue
 
-            mean = float(s.mean())
-            std = float(s.std(ddof=1)) if len(s) > 1 else 0.0
-            q25 = float(s.quantile(0.25))
-            q75 = float(s.quantile(0.75))
+            mean = float(s_nona.mean())
+            std = float(s_nona.std(ddof=1)) if len(s_nona) > 1 else 0.0
+            q01 = float(s_nona.quantile(0.01))
+            q25 = float(s_nona.quantile(0.25))
+            med = float(s_nona.median())
+            q75 = float(s_nona.quantile(0.75))
+            q99 = float(s_nona.quantile(0.99))
+            mn = float(s_nona.min())
+            mx = float(s_nona.max())
+            variance = float(s_nona.var(ddof=1)) if len(s_nona) > 1 else 0.0
+            rng = float(mx - mn)
             iqr = float(q75 - q25)
-            variance = float(s.var(ddof=1)) if len(s) > 1 else 0.0
-            rng = float(s.max() - s.min())
-            skew = float(s.skew()) if len(s) > 2 else 0.0
-            kurt = float(s.kurtosis()) if len(s) > 3 else 0.0
+            skew = float(s_nona.skew()) if len(s_nona) > 2 else 0.0
+            kurt = float(s_nona.kurtosis()) if len(s_nona) > 3 else 0.0
             cv = float(std / mean) if mean != 0 else None
 
+            # Flagi jakości
+            zero_var = bool(variance == 0.0)
+            if zero_var:
+                zero_vars.append(col)
+
+            # near-constant: dominująca wartość >= near_constant_ratio
+            mode_freq = int(s_nona.value_counts(dropna=False).iloc[0])
+            near_constant_flag = bool((mode_freq / max(1, len(s_nona))) >= self.config.near_constant_ratio)
+            if near_constant_flag and not zero_var:
+                near_constants.append(col)
+
+            if cv is not None and cv > self.config.cv_warn:
+                high_cv_cols.append(col)
+
+            # monotonic check
+            monotonic = None
+            try:
+                if s_nona.is_monotonic_increasing:
+                    monotonic = "increasing"
+                elif s_nona.is_monotonic_decreasing:
+                    monotonic = "decreasing"
+            except Exception:
+                monotonic = None
+
             features_stats[col] = {
-                "count": int(s.count()),
+                "count": int(s_nona.count()),
                 "mean": mean,
                 "std": std,
-                "min": float(s.min()),
+                "min": mn,
+                "q01": q01,
                 "q25": q25,
-                "median": float(s.median()),
+                "median": med,
                 "q75": q75,
-                "max": float(s.max()),
+                "q99": q99,
+                "max": mx,
                 "skewness": skew,
                 "kurtosis": kurt,
                 "variance": variance,
                 "range": rng,
                 "iqr": iqr,
                 "cv": cv,
-                "zero_variance": bool(variance == 0.0),
+                "zero_variance": zero_var,
+                "near_constant": near_constant_flag,
+                "monotonic": monotonic,
             }
 
-        return {
-            "n_features": len(num_cols),
-            "features": features_stats,
-            "summary": self._get_numeric_summary(features_stats),
-        }
+        summary = self._get_numeric_summary(features_stats, zero_vars, near_constants, high_cv_cols)
+        return {"n_features": len(num_cols), "features": features_stats, "summary": summary}
 
-    def _get_numeric_summary(self, features_stats: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """Summarize numeric features: wariancja, średnia skośność, zero-variance list."""
+    def _get_numeric_summary(
+        self,
+        features_stats: Dict[str, Dict[str, Any]],
+        zero_vars: List[str],
+        near_constants: List[str],
+        high_cv_cols: List[str],
+    ) -> Dict[str, Any]:
+        """Summarize numeric features."""
         if not features_stats:
             return {}
-
-        variances = {k: v["variance"] for k, v in features_stats.items()}
-        avg_skew = float(np.mean([v.get("skewness", 0.0) for v in features_stats.values()])) if variances else 0.0
-        zero_var_cols = [k for k, v in features_stats.items() if v.get("zero_variance")]
-        high_cv_cols = [k for k, v in features_stats.items() if (v.get("cv") is not None and v.get("cv") > self.config.cv_warn)]
+        variances = {k: v.get("variance", 0.0) for k, v in features_stats.items()}
+        # filtry, bo mogą istnieć kolumny bez variance w słowniku (puste po NA)
+        non_empty_var = {k: v for k, v in variances.items() if v is not None}
+        highest = max(non_empty_var, key=non_empty_var.get) if non_empty_var else None
+        lowest = min(non_empty_var, key=non_empty_var.get) if non_empty_var else None
+        avg_skew = float(np.mean([v.get("skewness", 0.0) for v in features_stats.values()])) if features_stats else 0.0
 
         return {
-            "highest_variance": max(variances, key=variances.get) if variances else None,
-            "lowest_variance": min(variances, key=variances.get) if variances else None,
+            "highest_variance": highest,
+            "lowest_variance": lowest,
             "avg_skewness": avg_skew,
-            "zero_variance_features": zero_var_cols,
+            "zero_variance_features": zero_vars,
+            "near_constant_features": near_constants,
             "high_cv_features": high_cv_cols,
         }
 
-    # === KATEGORYCZNE ===
+    # === NAZWA_SEKCJI === KATEGORYCZNE ===
     def _analyze_categorical_features(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze categorical features with top-k values and cardinality."""
+        """Analyze categorical features with top-k, kardynalnością i dominacją."""
         cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
         if len(cat_cols) == 0:
-            return {"n_features": 0, "features": {}, "message": "No categorical features found"}
+            return {"n_features": 0, "features": {}, "summary": {"high_cardinality_features": [], "dominant_classes_features": []}}
 
         features_stats: Dict[str, Dict[str, Any]] = {}
+        high_card_list: List[str] = []
+        dominant_list: List[str] = []
+
         for col in cat_cols:
-            s = df[col].dropna()
-            if s.empty:
+            s = df[col].astype("string")
+            s_nona = s.dropna()
+            if s_nona.empty:
                 continue
 
-            vc = s.value_counts()
+            vc = s_nona.value_counts()
             mode_val = None
             try:
-                m = s.mode()
+                m = s_nona.mode()
                 mode_val = str(m.iloc[0]) if not m.empty else None
             except Exception:
                 mode_val = None
 
-            n_unique = int(s.nunique())
+            n_unique = int(s_nona.nunique())
             topk = {str(k): int(v) for k, v in vc.head(self.config.top_k_values).to_dict().items()}
 
+            is_binary = bool(n_unique == 2)
+            if n_unique > self.config.high_cardinality_threshold:
+                cardinality = "high"; high_card_list.append(col)
+            elif n_unique > self.config.high_cardinality_threshold * 0.4:
+                cardinality = "medium"
+            else:
+                cardinality = "low"
+
+            mode_freq = int(vc.iloc[0]) if len(vc) > 0 else 0
+            mode_pct = float((mode_freq / max(1, len(s_nona))) * 100) if len(vc) > 0 else 0.0
+            if mode_pct > 80.0:
+                dominant_list.append(col)
+
             features_stats[col] = {
-                "count": int(s.count()),
+                "count": int(s_nona.count()),
                 "n_unique": n_unique,
                 "mode": mode_val,
-                "mode_frequency": int(vc.iloc[0]) if len(vc) > 0 else 0,
-                "mode_percentage": float((vc.iloc[0] / len(s)) * 100) if len(vc) > 0 else 0.0,
-                "top_5_values": topk,
-                "is_binary": bool(n_unique == 2),
-                "cardinality": "high" if n_unique > self.config.high_cardinality_threshold else "low",
+                "mode_frequency": mode_freq,
+                "mode_percentage": mode_pct,
+                "top_k_values": topk,
+                "is_binary": is_binary,
+                "cardinality": cardinality,
+                "majority_share": mode_pct,
             }
 
-            # BONUS: proporcja klasy dominującej (dla warningów nierównowagi kategorii)
-            if len(vc) > 0:
-                features_stats[col]["majority_share"] = float((vc.iloc[0] / len(s)) * 100)
+        return {"n_features": len(cat_cols), "features": features_stats,
+                "summary": {"high_cardinality_features": high_card_list, "dominant_classes_features": dominant_list}}
 
-        return {"n_features": len(cat_cols), "features": features_stats}
+    # === NAZWA_SEKCJI === ROZKŁADY ===
+    def _maybe_sample_for_tests(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, bool, Optional[Dict[str, int]]]:
+        """Sampling safety dla bardzo dużych tabel przy testach normalności."""
+        if len(df) > self.config.max_rows_for_tests:
+            self._log.info(f"Sampling for distribution tests: {len(df)} → {self.config.max_rows_for_tests}")
+            return df.sample(n=self.config.max_rows_for_tests, random_state=self.config.random_state), True, \
+                   {"from_rows": int(len(df)), "to_rows": int(self.config.max_rows_for_tests)}
+        return df, False, None
 
-    # === ROZKŁADY ===
     def _analyze_distributions(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Analyze distributions of numeric features (normalność + heurystyka kształtu)."""
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -249,18 +390,32 @@ class StatisticalAnalyzer(BaseAgent):
             if len(s) < 10:
                 continue  # zbyt mało danych do testów
 
+            # Test normalności: Shapiro (małe N), inaczej D’Agostino K²; fallback Anderson
             is_normal: Optional[bool] = None
-            if len(s) <= self.config.max_shapiro_n:
-                try:
+            test_name: Optional[str] = None
+            p_value: Optional[float] = None
+            try:
+                if len(s) <= self.config.max_shapiro_n:
                     stat, p = stats.shapiro(s)
                     is_normal = bool(p > self.config.normality_alpha)
+                    p_value = float(p); test_name = "shapiro"
+                else:
+                    k2, p = stats.normaltest(s, nan_policy="omit")
+                    is_normal = bool(p > self.config.normality_alpha)
+                    p_value = float(p); test_name = "dagostino"
+            except Exception:
+                try:
+                    ad = stats.anderson(s, dist="norm")
+                    # heurystyka: porównaj do 5% krytycznego
+                    crit_5 = float(ad.critical_values[2])
+                    is_normal = bool(ad.statistic < crit_5)
+                    p_value = None; test_name = "anderson"
                 except Exception:
-                    is_normal = None
+                    is_normal = None; test_name = None; p_value = None
 
             skew = float(s.skew()) if len(s) > 2 else 0.0
             kurt = float(s.kurtosis()) if len(s) > 3 else 0.0
 
-            # Heurystyka kształtu rozkładu
             if is_normal:
                 dist_type = "normal"
             elif abs(skew) < 0.5:
@@ -273,6 +428,8 @@ class StatisticalAnalyzer(BaseAgent):
             out[col] = {
                 "distribution_type": dist_type,
                 "is_normal": is_normal,
+                "normality_test": test_name,
+                "p_value": p_value,
                 "skewness": skew,
                 "kurtosis": kurt,
                 "has_outliers": self._check_outliers_iqr(s),
@@ -292,7 +449,7 @@ class StatisticalAnalyzer(BaseAgent):
         outliers = ((series < (q1 - 1.5 * iqr)) | (series > (q3 + 1.5 * iqr))).sum()
         return bool(outliers > 0)
 
-    # === REKOMENDACJE ===
+    # === NAZWA_SEKCJI === REKOMENDACJE ===
     def _build_recommendations(
         self,
         numeric_stats: Dict[str, Any],
@@ -302,34 +459,51 @@ class StatisticalAnalyzer(BaseAgent):
         """Tworzy krótką listę actionable rekomendacji na podstawie wyników."""
         rec: List[str] = []
 
-        # Zero-variance / high-CV
-        zero_vars = (numeric_stats.get("summary", {}) or {}).get("zero_variance_features", []) or []
+        num_summary = (numeric_stats.get("summary", {}) or {})
+        zero_vars = num_summary.get("zero_variance_features", []) or []
         if zero_vars:
             rec.append(f"❄️ Usuń cechy o zerowej wariancji: {', '.join(map(str, zero_vars[:3]))}...")
-        high_cv = (numeric_stats.get("summary", {}) or {}).get("high_cv_features", []) or []
-        if high_cv:
-            rec.append(f"📈 Cechy o wysokim CV: {', '.join(map(str, high_cv[:3]))} — rozważ skalowanie/transformacje.")
 
-        # Rozkłady: silna skośność / ciężkie ogony
+        near_const = num_summary.get("near_constant_features", []) or []
+        if near_const:
+            rec.append(f"🧊 Near-constant (≥98% tej samej wartości): {', '.join(map(str, near_const[:3]))} — rozważ drop/target encoding.")
+
+        high_cv = num_summary.get("high_cv_features", []) or []
+        if high_cv:
+            rec.append(f"📈 Wysokie CV: {', '.join(map(str, high_cv[:3]))} — rozważ skalowanie/transformacje (Yeo-Johnson/Box-Cox).")
+
+        # Rozkłady: skośność / ciężkie ogony
         skewed = [c for c, d in distributions.items() if d.get("high_skewness")]
         if skewed:
-            rec.append(f"↔️ Silnie skośne rozkłady: {', '.join(map(str, skewed[:3]))} — rozważ log/Box-Cox/Yeo-Johnson.")
+            rec.append(f"↔️ Silnie skośne: {', '.join(map(str, skewed[:3]))} — transformacje (log/Yeo-Johnson), robust modele.")
         heavy = [c for c, d in distributions.items() if d.get("heavy_tails")]
         if heavy:
-            rec.append(f"🪙 Ciężkie ogony: {', '.join(map(str, heavy[:3]))} — użyj robust loss/skalowania.")
+            rec.append(f"🪙 Ciężkie ogony: {', '.join(map(str, heavy[:3]))} — robust loss/skalowanie/winsoryzacja IQR.")
 
-        # Kategoryczne: wysoka kardynalność / dominujące klasy
+        # Kategoryczne
         cat_feats = categorical_stats.get("features", {}) or {}
         high_card = [c for c, v in cat_feats.items() if v.get("cardinality") == "high"]
         if high_card:
-            rec.append(f"🏷️ Wysoka kardynalność: {', '.join(map(str, high_card[:3]))} — rozważ target/catboost encoders.")
+            rec.append(f"🏷️ Wysoka kardynalność: {', '.join(map(str, high_card[:3]))} — rozważ CatBoost/target encoders.")
         dominant = [c for c, v in cat_feats.items() if v.get("majority_share", 0) > 80]
         if dominant:
-            rec.append(f"⚖️ Silnie niezbalansowane kategorie w: {', '.join(map(str, dominant[:3]))} — przemyśl grupowanie rzadkich klas.")
+            rec.append(f"⚖️ Dominacja klas w: {', '.join(map(str, dominant[:3]))} — łącz rzadkie klasy/waż wagi klas.")
 
-        # Jeśli nic nie wyszło szczególnego
         if not rec:
-            rec.append("✅ Rozkłady i wariancje wyglądają stabilnie — możesz przejść do kolejnych kroków EDA/feature engineering.")
+            rec.append("✅ Rozkłady i wariancje wyglądają stabilnie — możesz przejść do FE/ML.")
 
-        # dedup
-        return list(dict.fromkeys(rec))
+        return list(dict.fromkeys(rec))  # dedup
+
+    # === NAZWA_SEKCJI === PAYLOAD DLA PUSTYCH DANYCH ===
+    @staticmethod
+    def _empty_payload() -> Dict[str, Any]:
+        return {
+            "overall": {"n_rows": 0, "n_columns": 0, "n_numeric": 0, "n_categorical": 0, "memory_mb": 0.0, "sparsity": 0.0},
+            "numeric_features": {"n_features": 0, "features": {}, "summary": {}},
+            "categorical_features": {"n_features": 0, "features": {}, "summary": {"high_cardinality_features": [], "dominant_classes_features": []}},
+            "distributions": {},
+            "recommendations": ["Dostarcz dane, aby przeprowadzić analizę statystyczną."],
+            "summary": {"n_zero_variance": 0, "n_near_constant": 0, "n_high_cv": 0, "n_high_cardinality": 0, "n_dominant_categorical": 0},
+            "telemetry": {"elapsed_ms": 0.0, "timings_ms": {"overall": 0.0, "numeric": 0.0, "categorical": 0.0, "distributions": 0.0},
+                          "sampled_for_tests": False, "sample_info": None}
+        }

@@ -1,20 +1,35 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - AI Mentor Orchestrator (PRO+++)
-Główny agent AI Mentor z integracją LLM: wyjaśnienia EDA/ML, rekomendacje, Q&A.
-Defensywna walidacja, kontrola kontekstu, retry/backoff i spójny kontrakt wyników.
+DataGenius PRO++++ - AI Mentor Orchestrator (KOSMOS)
+Wyjaśnienia EDA/ML, rekomendacje i Q&A z LLM.
+
+Funkcje PRO:
+- defensywna walidacja
+- PII scrub (email/telefon/IP/PESEL-like + whitespace normalization)
+- limiter kontekstu (head/tail, soft i hard cap)
+- retry + exponential backoff + pełny jitter
+- circuit-breaker (licznik awarii + cooldown)
+- JSON-first z bezpiecznym fallbackiem do tekstu
+- telemetry: czasy, próby, token hints, breaker/caching info
+- cache (LRU+TTL) dla identycznych zapytań + kontekstu
+- dependency injection LLM klienta
 """
 
-# === IMPORTY ===
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Any, List, Optional, Tuple, Literal
-
+import json
 import math
+import os
+import random
 import time
+import hashlib
+import threading
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple, Literal
+
+import pandas as pd
 from loguru import logger
-import pandas as pd  # zgodnie z zależnością modułu (może nie być używany bezpośrednio)
 
 from core.base_agent import BaseAgent, AgentResult
 from core.llm_client import get_llm_client
@@ -29,54 +44,101 @@ from agents.mentor.prompt_templates import (
 # === KONFIG / PARAMETRY ===
 @dataclass(frozen=True)
 class MentorConfig:
-    """Ustawienia działania Mentora."""
-    temperature: float = 0.7
-    max_tokens: int = 2000                # dla odpowiedzi tekstowych
-    json_max_tokens: int = 1200           # dla odpowiedzi JSON
-    retries: int = 2                      # dodatkowe próby po błędach tymczasowych
-    initial_backoff_s: float = 0.6        # początkowy backoff
-    context_max_chars: int = 60_000       # twardy limit znaków kontekstu do LLM
-    trim_section_head: int = 8_000        # ile znaków pobrać z początku sekcji przy trimie
-    trim_section_tail: int = 2_000        # ile z końca (np. rekomendacje/podsumowania)
-    # hint: jeśli klient LLM wspiera timeout — warto użyć (tu tylko semantycznie)
+    temperature: float = 0.45
+    max_tokens: int = 2000
+    json_max_tokens: int = 1400
     request_timeout_s: Optional[float] = None
 
+    # retry/backoff
+    retries: int = 2
+    initial_backoff_s: float = 0.6
+    backoff_multiplier: float = 2.0
+    jitter_fraction: float = 0.25
 
-# === KLASA GŁÓWNA ===
+    # context & scrub
+    pii_scrub: bool = True
+    context_max_chars: int = 60_000         # hard cap po scrubie
+    trim_section_head: int = 10_000
+    trim_section_tail: int = 3_000
+    prefer_json: bool = True
+
+    # breaker
+    circuit_breaker_failures: int = 3
+    circuit_breaker_cooldown_s: float = 30.0
+
+    # cache
+    cache_enabled: bool = True
+    cache_ttl_s: int = 120                  # krótki TTL (zapytania/EDA zwykle efemeryczne)
+    cache_maxsize: int = 256
+
+    # logging
+    audit_log_safe_context: bool = True
+
+
+def _now_s() -> float:
+    return time.time()
+
+
+def _hash_key(*parts: str) -> str:
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p.encode("utf-8", "ignore"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+class _TTLCache:
+    """Prosty cache z TTL + maxsize (lock-safe)."""
+    def __init__(self, maxsize: int, ttl_s: int):
+        self.maxsize = maxsize
+        self.ttl_s = ttl_s
+        self._store: Dict[str, Tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            ts, val = item
+            if _now_s() - ts > self.ttl_s:
+                self._store.pop(key, None)
+                return None
+            return val
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            if len(self._store) >= self.maxsize:
+                # najprostsza polityka: drop najstarszy
+                oldest_key = min(self._store.items(), key=lambda kv: kv[1][0])[0]
+                self._store.pop(oldest_key, None)
+            self._store[key] = (_now_s(), value)
+
+
 class MentorOrchestrator(BaseAgent):
     """
-    AI Mentor - provides explanations and recommendations in Polish.
+    AI Mentor - wyjaśnienia i rekomendacje w oparciu o wyniki EDA/ML.
+    Modularny, defensywny i z telemetrią PRO++++.
     """
 
-    def __init__(self, config: Optional[MentorConfig] = None) -> None:
-        super().__init__(
-            name="MentorOrchestrator",
-            description="AI Mentor for data science guidance"
-        )
-        self.llm_client = get_llm_client()
+    def __init__(self, config: Optional[MentorConfig] = None, llm_client: Any = None) -> None:
+        super().__init__(name="MentorOrchestrator", description="AI Mentor for data science guidance")
         self.config = config or MentorConfig()
+        self.llm_client = llm_client or self._safe_get_llm_client()
+        # circuit breaker
+        self._fail_streak = 0
+        self._breaker_until_ts: float = 0.0
+        # cache
+        self._cache = _TTLCache(self.config.cache_maxsize, self.config.cache_ttl_s)
 
-    # === WYKONANIE GŁÓWNE ===
-    def execute(
-        self,
-        query: str,
-        context: Optional[Dict[str, Any]] = None,
-        **kwargs: Any
-    ) -> AgentResult:
-        """
-        Process user query with AI Mentor.
-
-        Args:
-            query: User question (required)
-            context: Additional context (EDA results, ML results, data_info)
-
-        Returns:
-            AgentResult with AI Mentor response
-        """
+    # === API: główna odpowiedź ===
+    def execute(self, query: str, context: Optional[Dict[str, Any]] = None, **kwargs: Any) -> AgentResult:
         result = AgentResult(agent_name=self.name)
+        t0 = time.perf_counter()
+        c = self.config
 
         try:
-            # Walidacja wejścia
+            # walidacja
             if not isinstance(query, str) or not query.strip():
                 msg = "MentorOrchestrator: 'query' must be a non-empty string."
                 result.add_error(msg)
@@ -88,190 +150,202 @@ class MentorOrchestrator(BaseAgent):
                 self.logger.error(msg)
                 return result
 
-            # Zbuduj/obtnij kontekst
-            context_str = self._build_context(context or {})
-            context_str = self._trim_context_if_needed(context_str)
+            # breaker
+            if self._is_breaker_open():
+                cooldown = max(0.0, self._breaker_until_ts - _now_s())
+                warn = f"Circuit breaker is open. Cooldown {cooldown:.1f}s."
+                self.logger.warning(warn)
+                result.add_warning(warn)
+                result.data = {
+                    "response": "Tymczasowa przerwa w wywołaniach LLM (zabezpieczenie). Spróbuj ponownie.",
+                    "telemetry": self._telemetry(t0, retries_used=0, tokens_used=None, breaker_state="open", cache_hit=False),
+                    "version": "4.1-kosmos",
+                }
+                return result
 
-            # Stwórz prompt
+            # kontekst
+            context_str = self._prepare_context(context or {})
             full_prompt = self._create_prompt(query, context_str)
 
-            # Wywołanie LLM z retry/backoff
+            # cache
+            cache_key = None
+            cache_hit = False
+            if c.cache_enabled:
+                cache_key = _hash_key("resp", full_prompt, MENTOR_SYSTEM_PROMPT or "")
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    cache_hit = True
+                    content, tokens_used = cached
+                    self._reset_breaker()
+                    result.data = {
+                        "response": content,
+                        "query": query,
+                        "tokens_used": tokens_used,
+                        "meta": {
+                            "temperature": c.temperature,
+                            "max_tokens": c.max_tokens,
+                            "context_chars": len(context_str),
+                        },
+                        "telemetry": self._telemetry(t0, retries_used=0, tokens_used=tokens_used,
+                                                     breaker_state="closed", cache_hit=True),
+                        "version": "4.1-kosmos",
+                    }
+                    return result
+
+            # LLM call
             response = self._call_llm_with_retry(
                 prompt=full_prompt,
                 system_prompt=MENTOR_SYSTEM_PROMPT,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens
+                temperature=c.temperature,
+                max_tokens=c.max_tokens,
             )
-
-            # Uporządkuj wynik
             content = getattr(response, "content", None) or str(response)
             tokens_used = getattr(response, "tokens_used", None)
 
+            # cache set
+            if c.cache_enabled and cache_key:
+                try:
+                    self._cache.set(cache_key, (content, tokens_used))
+                except Exception:
+                    pass
+
+            self._reset_breaker()
             result.data = {
                 "response": content,
                 "query": query,
                 "tokens_used": tokens_used,
                 "meta": {
-                    "temperature": self.config.temperature,
-                    "max_tokens": self.config.max_tokens,
+                    "temperature": c.temperature,
+                    "max_tokens": c.max_tokens,
                     "context_chars": len(context_str),
-                }
+                },
+                "telemetry": self._telemetry(t0, retries_used=min(self._fail_streak, c.retries),
+                                             tokens_used=tokens_used, breaker_state="closed", cache_hit=cache_hit),
+                "version": "4.1-kosmos",
             }
             self.logger.success("AI Mentor response generated")
+            return result
 
         except Exception as e:
+            self._register_failure()
             result.add_error(f"AI Mentor failed: {e}")
+            result.data = {
+                "response": "Nie udało się wygenerować odpowiedzi (degradacja bezpieczna).",
+                "telemetry": self._telemetry(t0, retries_used=self._fail_streak, tokens_used=None,
+                                             breaker_state="maybe_open", cache_hit=False),
+                "version": "4.1-kosmos",
+            }
             self.logger.error(f"AI Mentor error: {e}", exc_info=True)
+            return result
 
-        return result
-
-    # === WYJAŚNIENIA EDA ===
-    def explain_eda_results(
-        self,
-        eda_results: Dict[str, Any],
-        user_level: Literal["beginner", "intermediate", "advanced"] = "beginner"
-    ) -> str:
-        """Explain EDA results in user-friendly way."""
+    # === API: wyjaśnienia EDA ===
+    def explain_eda_results(self, eda_results: Dict[str, Any], user_level: Literal["beginner", "intermediate", "advanced"] = "beginner") -> str:
         try:
             if not isinstance(eda_results, dict):
                 raise ValueError("'eda_results' must be a dict")
-
-            eda_str = self._trim_context_if_needed(self._safe_stringify(eda_results))
-            prompt = EDA_EXPLANATION_TEMPLATE.format(
-                eda_results=eda_str,
-                user_level=user_level
-            )
-
-            response = self._call_llm_with_retry(
-                prompt=prompt,
-                system_prompt=MENTOR_SYSTEM_PROMPT,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens
-            )
-            return getattr(response, "content", "") or "—"
+            eda_str = self._prepare_context({"eda_results": eda_results})
+            prompt = EDA_EXPLANATION_TEMPLATE.format(eda_results=eda_str, user_level=user_level)
+            resp = self._call_llm_with_retry(prompt=prompt, system_prompt=MENTOR_SYSTEM_PROMPT,
+                                             temperature=self.config.temperature, max_tokens=self.config.max_tokens)
+            self._reset_breaker()
+            return getattr(resp, "content", "") or "—"
         except Exception as e:
+            self._register_failure()
             self.logger.error(f"EDA explanation failed: {e}")
             return "Przepraszam, nie udało się wygenerować wyjaśnienia."
 
-    # === WYJAŚNIENIA ML ===
-    def explain_ml_results(
-        self,
-        ml_results: Dict[str, Any],
-        user_level: Literal["beginner", "intermediate", "advanced"] = "beginner"
-    ) -> str:
-        """Explain ML results."""
+    # === API: wyjaśnienia ML ===
+    def explain_ml_results(self, ml_results: Dict[str, Any], user_level: Literal["beginner", "intermediate", "advanced"] = "beginner") -> str:
         try:
             if not isinstance(ml_results, dict):
                 raise ValueError("'ml_results' must be a dict")
-
-            ml_str = self._trim_context_if_needed(self._safe_stringify(ml_results))
-            prompt = ML_RESULTS_TEMPLATE.format(
-                ml_results=ml_str,
-                user_level=user_level
-            )
-
-            response = self._call_llm_with_retry(
-                prompt=prompt,
-                system_prompt=MENTOR_SYSTEM_PROMPT,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens
-            )
-            return getattr(response, "content", "") or "—"
+            ml_str = self._prepare_context({"ml_results": ml_results})
+            prompt = ML_RESULTS_TEMPLATE.format(ml_results=ml_str, user_level=user_level)
+            resp = self._call_llm_with_retry(prompt=prompt, system_prompt=MENTOR_SYSTEM_PROMPT,
+                                             temperature=self.config.temperature, max_tokens=self.config.max_tokens)
+            self._reset_breaker()
+            return getattr(resp, "content", "") or "—"
         except Exception as e:
+            self._register_failure()
             self.logger.error(f"ML explanation failed: {e}")
             return "Przepraszam, nie udało się wygenerować wyjaśnienia."
 
-    # === REKOMENDACJE ===
+    # === API: rekomendacje (JSON-first) ===
     def generate_recommendations(
         self,
         eda_results: Optional[Dict[str, Any]] = None,
         ml_results: Optional[Dict[str, Any]] = None,
         data_quality: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
-        """
-        Generate actionable recommendations as a list of strings.
-        """
         try:
-            context = {
-                "eda": eda_results or {},
-                "ml": ml_results or {},
-                "quality": data_quality or {},
-            }
-            ctx_str = self._trim_context_if_needed(self._safe_stringify(context))
-
+            ctx = {"eda": eda_results or {}, "ml": ml_results or {}, "quality": data_quality or {}}
+            ctx_str = self._prepare_context(ctx)
             prompt = RECOMMENDATION_TEMPLATE.format(context=ctx_str)
 
-            # prefer JSON zwrot
-            resp_json = self._call_llm_json_with_retry(
-                prompt=prompt,
-                system_prompt=MENTOR_SYSTEM_PROMPT,
-                max_tokens=self.config.json_max_tokens
-            )
+            recs: List[str] = []
+            if self.config.prefer_json:
+                resp_json = self._call_llm_json_with_retry(prompt=prompt, system_prompt=MENTOR_SYSTEM_PROMPT,
+                                                           max_tokens=self.config.json_max_tokens)
+                if isinstance(resp_json, dict):
+                    if isinstance(resp_json.get("recommendations"), list):
+                        recs = [str(x).strip() for x in resp_json["recommendations"] if str(x).strip()]
+                    elif isinstance(resp_json.get("data"), list):
+                        recs = [str(x).strip() for x in resp_json["data"] if str(x).strip()]
 
-            recs = []
-            if isinstance(resp_json, dict):
-                # wspieraj zarówno {"recommendations": [...]}, jak i prostą listę
-                if "recommendations" in resp_json and isinstance(resp_json["recommendations"], list):
-                    recs = [str(x) for x in resp_json["recommendations"]]
-                elif isinstance(resp_json.get("data"), list):
-                    recs = [str(x) for x in resp_json["data"]]
             if not recs:
-                # fallback: spróbuj zwykły generate i heurystycznie pociąć po liniach
-                self.logger.warning("LLM JSON empty/invalid. Falling back to text generation for recommendations.")
-                txt = self._call_llm_with_retry(
-                    prompt=prompt,
-                    system_prompt=MENTOR_SYSTEM_PROMPT,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens
-                )
+                self.logger.warning("LLM JSON empty/invalid. Fallback -> text.")
+                txt = self._call_llm_with_retry(prompt=prompt, system_prompt=MENTOR_SYSTEM_PROMPT,
+                                                temperature=self.config.temperature, max_tokens=self.config.max_tokens)
                 content = getattr(txt, "content", "") or ""
                 recs = [line.strip("-• ").strip() for line in content.splitlines() if line.strip()]
 
-            # sanity
-            recs = [r for r in recs if r]
+            self._reset_breaker()
             return recs or ["Nie udało się wygenerować rekomendacji."]
 
         except Exception as e:
+            self._register_failure()
             self.logger.error(f"Recommendation generation failed: {e}")
             return ["Nie udało się wygenerować rekomendacji."]
 
-    # === KONTEXT ===
-    def _build_context(self, context: Dict[str, Any]) -> str:
-        """Składa kontekst z priorytetem sekcji i czytelnymi nagłówkami."""
+    # === Kontekst / Prompt ===
+    def _prepare_context(self, context: Dict[str, Any]) -> str:
         parts: List[str] = []
 
-        if "eda_results" in context:
-            parts.append("**Wyniki EDA:**\n" + self._safe_stringify(context["eda_results"]))
-        if "ml_results" in context:
-            parts.append("**Wyniki ML:**\n" + self._safe_stringify(context["ml_results"]))
-        if "data_info" in context:
-            parts.append("**Informacje o danych:**\n" + self._safe_stringify(context["data_info"]))
+        def _pack(title: str, obj: Any) -> str:
+            s = self._safe_stringify(obj)
+            if self.config.pii_scrub:
+                s = self._scrub_pii(s)
+            return f"**{title}:**\n{s}"
 
-        return "\n\n".join(parts).strip()
+        if "eda_results" in context:
+            parts.append(_pack("Wyniki EDA", context["eda_results"]))
+        if "ml_results" in context:
+            parts.append(_pack("Wyniki ML", context["ml_results"]))
+        if "data_info" in context:
+            parts.append(_pack("Informacje o danych", context["data_info"]))
+        # inne klucze (bez duplikacji)
+        for k, v in context.items():
+            if k not in {"eda_results", "ml_results", "data_info"}:
+                parts.append(_pack(k, v))
+
+        joined = "\n\n".join(parts).strip()
+        return self._trim_context_if_needed(joined)
 
     def _create_prompt(self, query: str, context: str) -> str:
-        """Składa kompletny prompt dla LLM (z kontekstem jeśli jest)."""
         if context:
-            return f"""Kontekst analizy:
-{context}
-
-Pytanie użytkownika:
-{query}
-
-Odpowiedz po polsku, rzeczowo i praktycznie. Preferuj krótkie sekcje, listy punktowane i jasne rekomendacje."""
+            return (
+                f"Kontekst analizy:\n{context}\n\n"
+                f"Pytanie użytkownika:\n{query}\n\n"
+                "Odpowiedz po polsku, konkretnie, używając krótkich akapitów i list punktowanych tam, gdzie to sensowne. "
+                "Jeśli informacji brakuje — zaznacz to i zaproponuj kolejny krok."
+            )
         return query
 
-    # === LLM CALLS Z RETRY/BACKOFF ===
-    def _call_llm_with_retry(
-        self,
-        prompt: str,
-        system_prompt: Optional[str],
-        temperature: float,
-        max_tokens: int
-    ):
-        """Wywołuje LLM.generate z retry/backoff (błędy chwilowe / rate limit)."""
-        attempts = self.config.retries + 1
-        delay = self.config.initial_backoff_s
+    # === LLM CALLS (retry/backoff+jitter / JSON-first) ===
+    def _call_llm_with_retry(self, prompt: str, system_prompt: Optional[str], temperature: float, max_tokens: int):
+        c = self.config
+        attempts = c.retries + 1
+        delay = c.initial_backoff_s
         last_err: Optional[Exception] = None
 
         for i in range(attempts):
@@ -281,25 +355,23 @@ Odpowiedz po polsku, rzeczowo i praktycznie. Preferuj krótkie sekcje, listy pun
                     system_prompt=system_prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    timeout=self.config.request_timeout_s,
+                    timeout=c.request_timeout_s,
                 )
             except Exception as e:
                 last_err = e
                 self.logger.warning(f"LLM generate failed (attempt {i+1}/{attempts}): {e}")
                 if i < attempts - 1:
-                    time.sleep(delay)
-                    delay *= 2
+                    jitter = delay * c.jitter_fraction
+                    sleep_s = max(0.05, delay + random.uniform(-jitter, jitter))
+                    time.sleep(sleep_s)
+                    delay *= c.backoff_multiplier
+
         raise RuntimeError(f"LLM generate failed after {attempts} attempts: {last_err}")
 
-    def _call_llm_json_with_retry(
-        self,
-        prompt: str,
-        system_prompt: Optional[str],
-        max_tokens: int
-    ) -> Dict[str, Any]:
-        """Wywołuje LLM.generate_json z retry/backoff; zwraca dict lub {}."""
-        attempts = self.config.retries + 1
-        delay = self.config.initial_backoff_s
+    def _call_llm_json_with_retry(self, prompt: str, system_prompt: Optional[str], max_tokens: int) -> Dict[str, Any]:
+        c = self.config
+        attempts = c.retries + 1
+        delay = c.initial_backoff_s
         last_err: Optional[Exception] = None
 
         for i in range(attempts):
@@ -308,16 +380,13 @@ Odpowiedz po polsku, rzeczowo i praktycznie. Preferuj krótkie sekcje, listy pun
                     prompt=prompt,
                     system_prompt=system_prompt,
                     max_tokens=max_tokens,
-                    timeout=self.config.request_timeout_s,
+                    timeout=c.request_timeout_s,
                 )
                 if isinstance(resp, dict):
                     return resp
-                # niektóre klienty zwracają obiekt z .json lub .content
                 if hasattr(resp, "json") and isinstance(resp.json, dict):
                     return resp.json
                 if hasattr(resp, "content") and isinstance(resp.content, str):
-                    # awaryjny parse: prosta heurystyka (jeśli to json string)
-                    import json
                     try:
                         return json.loads(resp.content)
                     except Exception:
@@ -327,22 +396,43 @@ Odpowiedz po polsku, rzeczowo i praktycznie. Preferuj krótkie sekcje, listy pun
                 last_err = e
                 self.logger.warning(f"LLM generate_json failed (attempt {i+1}/{attempts}): {e}")
                 if i < attempts - 1:
-                    time.sleep(delay)
-                    delay *= 2
+                    jitter = delay * c.jitter_fraction
+                    sleep_s = max(0.05, delay + random.uniform(-jitter, jitter))
+                    time.sleep(sleep_s)
+                    delay *= c.backoff_multiplier
+
         self.logger.error(f"LLM generate_json failed after {attempts} attempts: {last_err}")
         return {}
 
-    # === POMOCNICZE ===
-    def _safe_stringify(self, obj: Any) -> str:
-        """Bezpieczne i krótkie zamienianie dict/list na string (dla promptu)."""
+    # === Bezpieczeństwo / utils ===
+    def _scrub_pii(self, text: str) -> str:
+        """Lekki PII scrubber: e-mail, telefon, IPv4, PESEL-like, normalizacja whitespace."""
         try:
-            import json
-            return json.dumps(obj, ensure_ascii=False, default=str)[: self.config.context_max_chars]
+            import re
+            # normalize whitespace
+            text = re.sub(r"[ \t]+", " ", text)
+            # emails
+            text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[EMAIL]", text)
+            # phone (+48 123-456-789, itp.)
+            text = re.sub(r"\b(\+?\d[\d\s\-]{7,}\d)\b", "[PHONE]", text)
+            # IPv4
+            text = re.sub(r"\b(\d{1,3}\.){3}\d{1,3}\b", "[IPV4]", text)
+            # PESEL-like (11 cyfr)
+            text = re.sub(r"\b\d{11}\b", "[ID]", text)
+            return text
         except Exception:
-            return str(obj)[: self.config.context_max_chars]
+            return text
+
+    def _safe_stringify(self, obj: Any) -> str:
+        try:
+            s = json.dumps(obj, ensure_ascii=False, default=str)
+        except Exception:
+            s = str(obj)
+        # wstępny soft-cap; finalny hard-cap w _trim_context_if_needed
+        max_pre = self.config.context_max_chars * 2
+        return s[: max_pre]
 
     def _trim_context_if_needed(self, context: str) -> str:
-        """Jeśli kontekst przekracza limit znaków — skraca selektywnie (head + tail)."""
         max_len = self.config.context_max_chars
         if len(context) <= max_len:
             return context
@@ -350,3 +440,46 @@ Odpowiedz po polsku, rzeczowo i praktycznie. Preferuj krótkie sekcje, listy pun
         tail = context[-self.config.trim_section_tail :]
         note = f"\n\n[Uwaga: kontekst skrócony do {max_len} znaków]"
         return head + "\n...\n" + tail + note
+
+    def _safe_get_llm_client(self):
+        try:
+            return get_llm_client()
+        except Exception as e:
+            logger.warning(f"LLM client unavailable; Mentor runs in degraded mode. Reason: {e}")
+            class _NullClient:
+                def generate(self, *a, **k):
+                    raise RuntimeError("LLM client not available")
+                def generate_json(self, *a, **k):
+                    raise RuntimeError("LLM client not available")
+            return _NullClient()
+
+    # === Breaker / Telemetry ===
+    def _is_breaker_open(self) -> bool:
+        if self._fail_streak < self.config.circuit_breaker_failures:
+            return False
+        return _now_s() < self._breaker_until_ts
+
+    def _register_failure(self) -> None:
+        self._fail_streak += 1
+        if self._fail_streak >= self.config.circuit_breaker_failures:
+            self._breaker_until_ts = _now_s() + self.config.circuit_breaker_cooldown_s
+            self.logger.warning(
+                f"Circuit breaker OPEN for {self.config.circuit_breaker_cooldown_s}s "
+                f"(failures={self._fail_streak})."
+            )
+
+    def _reset_breaker(self) -> None:
+        if self._fail_streak > 0:
+            self.logger.info(f"Circuit breaker reset (fail_streak={self._fail_streak} -> 0).")
+        self._fail_streak = 0
+        self._breaker_until_ts = 0.0
+
+    def _telemetry(self, t0: float, *, retries_used: int, tokens_used: Optional[int],
+                   breaker_state: str, cache_hit: bool) -> Dict[str, Any]:
+        return {
+            "elapsed_s": round(time.perf_counter() - t0, 4),
+            "retries_used": retries_used,
+            "tokens_used": tokens_used,
+            "breaker_state": breaker_state,   # 'open' | 'closed' | 'maybe_open'
+            "cache_hit": cache_hit,
+        }

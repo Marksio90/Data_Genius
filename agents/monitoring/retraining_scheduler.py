@@ -1,12 +1,19 @@
-# === retraining_scheduler.py ===
+# === retraining_scheduler.py (PRO++++ / KOSMOS) ===
 """
-DataGenius PRO - Retraining Scheduler (PRO+++)
-Decyduje o konieczności retrainu modelu na bazie driftu danych, spadku jakości,
-wieku modelu i wolumenu nowych danych. Generuje rekomendowany harmonogram (cron),
-obsługuje cooldown i limity tygodniowe, a opcjonalnie uruchamia retraining
-przez MLOrchestrator. Zapisuje audyt do retraining_log.csv.
+DataGenius PRO++++ — Retraining Scheduler (KOSMOS)
+Decyduje o retrainie na podstawie: driftu danych, spadku jakości, wieku modelu i wolumenu nowych danych.
+Generuje rekomendowany harmonogram (cron + iCal VEVENT), obsługuje cooldown i limity tygodniowe,
+a opcjonalnie uruchamia retraining przez MLOrchestrator. Zapisuje audyt do retraining_log.csv.
 
-Zależności: pandas, numpy, loguru. (opcjonalnie zoneinfo z stdlib do TZ)
+Najważniejsze cechy KOSMOS:
+- Sygnalizacja: drift (% cech, top cechy, target drift), performance delta (accuracy/r2), wiek modelu, wolumen.
+- Skoring decyzyjny: wagi drift/perf/age + progi priorytetów (low/medium/high).
+- Triggery „twarde” (hard): critical drift, target drift, krytyczny wiek.
+- Polityki operacyjne: cooldown dniowy, limit retrainów / 7 dni, minimalny wolumen próbek.
+- Harmonogram: najbliższe okno w preferowanej godzinie + cron + iCal VEVENT (z TZ jeśli dostępny).
+- Tryb natychmiastowy: jeśli dostarczono orchestrator + dane → uruchamia retrain i dołącza wynik.
+- Bogaty kontrakt wyniku: {decision, schedule, signals, retrain_result, audit_log_path} + telemetry.
+- Defensywa: bezpieczne parsowanie, odporność na braki, stabilne typy, brak twardych zależności spoza stdlib/pandas.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ from typing import Any, Dict, Optional, List, Literal, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import math
+import json
 
 import numpy as np
 import pandas as pd
@@ -31,7 +39,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # fallback – użyj UTC
 
 
-# === KONFIGURACJA POLITYKI RETRAINU ===
+# === POLITYKA RETRAINU ===
 @dataclass(frozen=True)
 class RetrainPolicy:
     # Drift (z DriftDetector)
@@ -40,9 +48,9 @@ class RetrainPolicy:
     target_drift_triggers: bool = True    # drift targetu zawsze triggeruje
 
     # Performance (z PerformanceTracker.compare)
-    max_acc_drop_pct: float = 2.0         # dopuszczalny spadek accuracy (p.p.) względem baseline
-    max_f1_drop_pct: float = 2.0          # dopuszczalny spadek F1 (p.p.)
-    max_r2_drop_abs: float = 0.03         # spadek R^2 (bezwzględnie)
+    max_acc_drop_pct: float = 2.0         # dopuszczalny spadek accuracy [p.p.] vs baseline
+    max_f1_drop_pct: float = 2.0          # dopuszczalny spadek F1 [p.p.] (informacyjnie)
+    max_r2_drop_abs: float = 0.03         # spadek R^2 (bezwzględny)
 
     # Wiek i wolumen
     age_warn_days: int = 14               # ostrzeżenie wieku modelu
@@ -73,6 +81,8 @@ class RetrainingScheduler(BaseAgent):
     """
     Ocena konieczności retrainu + harmonogram + (opcjonalny) natychmiastowy retrain.
     """
+
+    version: str = "3.4-kosmos"
 
     def __init__(self, policy: Optional[RetrainPolicy] = None):
         super().__init__(
@@ -112,6 +122,7 @@ class RetrainingScheduler(BaseAgent):
         Gdy podasz `train_data` + `target_column` + `orchestrator`, i decyzja==True → wykona retrain.
         """
         res = AgentResult(agent_name=self.name)
+        t0 = datetime.utcnow()
 
         try:
             # 1) Zbierz sygnały
@@ -129,52 +140,70 @@ class RetrainingScheduler(BaseAgent):
             # 3) Triggery binarne
             triggers, hard_trigger = self._compute_triggers(drift, perf, age_days)
 
-            # 4) Decyzja
+            # 4) Decyzja (lub override force)
             should_retrain = (
                 (hard_trigger or score >= self.policy.priority_medium_threshold)
                 and cooldown_ok and weekly_ok and vol_ok
-            ) or force
+            ) or bool(force)
 
             # 5) Harmonogram (zalecenie)
-            next_time_iso, cron, window = self._recommend_schedule()
+            next_local_iso, cron, window, vevent = self._recommend_schedule()
 
             # 6) Opcjonalny natychmiastowy retrain
             retrain_result: Optional[Dict[str, Any]] = None
             status = "DECIDED_NO_ACTION"
+            run_ok = False
             if should_retrain and orchestrator is not None and train_data is not None and target_column:
                 try:
                     self.logger.info("Starting immediate retraining via orchestrator…")
-                    ok, retrain_result = self._run_immediate_retrain(
+                    run_ok, retrain_result = self._run_immediate_retrain(
                         orchestrator=orchestrator,
                         train_data=train_data,
                         target_column=target_column,
                         problem_type=problem_type,
                         orchestrator_kwargs=orchestrator_kwargs or {}
                     )
-                    status = "RETRAIN_OK" if ok else "RETRAIN_FAILED"
+                    status = "RETRAIN_OK" if run_ok else "RETRAIN_FAILED"
                 except Exception as e:
                     status = "RETRAIN_FAILED"
                     self.logger.error(f"Immediate retrain error: {e}", exc_info=True)
 
-            # 7) Audit log
+            # 7) Audit log (append-only)
             self._append_log_record({
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.utcnow().isoformat() + "Z",
                 "problem_type": problem_type,
                 "decision": bool(should_retrain),
                 "priority": priority,
-                "score": round(score, 6),
+                "score": round(float(score), 6),
                 "drift_pct": drift["pct"],
                 "target_drift": drift["target_drift"],
                 "perf_delta_primary": perf["primary_delta"],
-                "age_days": age_days,
+                "age_days": int(age_days),
                 "new_samples": int(new_samples or -1),
-                "cooldown_ok": cooldown_ok,
-                "weekly_ok": weekly_ok,
-                "volume_ok": vol_ok,
+                "cooldown_ok": bool(cooldown_ok),
+                "weekly_ok": bool(weekly_ok),
+                "volume_ok": bool(vol_ok),
                 "status": status
             })
 
-            # 8) Zwróć wynik
+            # 8) Telemetria
+            telemetry = {
+                "elapsed_s": round((datetime.utcnow() - t0).total_seconds(), 4),
+                "version": self.version,
+                "policy": {
+                    "cooldown_days": self.policy.cooldown_days,
+                    "max_retrains_per_week": self.policy.max_retrains_per_week,
+                    "min_new_samples": self.policy.min_new_samples
+                }
+            }
+
+            # 9) Uzasadnienie decyzji (krótka narracja)
+            reasoning = self._build_reasoning(
+                should_retrain=should_retrain, score=score, priority=priority, parts=parts,
+                triggers=triggers, cooldown_ok=cooldown_ok, weekly_ok=weekly_ok, vol_ok=vol_ok, force=force
+            )
+
+            # 10) Zwróć wynik
             res.data = {
                 "decision": {
                     "should_retrain": bool(should_retrain),
@@ -185,21 +214,24 @@ class RetrainingScheduler(BaseAgent):
                     "force": bool(force),
                     "cooldown": cooldown_info,
                     "weekly_limit": weekly_info,
-                    "volume_ok": vol_ok,
+                    "volume_ok": bool(vol_ok),
+                    "reasoning": reasoning
                 },
                 "schedule": {
-                    "next_time_iso": next_time_iso,
+                    "next_time_local_iso": next_local_iso,
                     "cron": cron,
                     "window": window,
+                    "ical_vevent": vevent
                 },
                 "signals": {
                     "drift": drift,
                     "performance": perf,
-                    "age_days": age_days,
+                    "age_days": int(age_days),
                     "new_samples": int(new_samples or -1),
                 },
-                "retrain_result": retrain_result,
+                "retrain_result": retrain_result if run_ok else None,
                 "audit_log_path": str(self.log_path),
+                "telemetry": telemetry
             }
 
             msg = "Retraining scheduled" if should_retrain else "Retraining not required"
@@ -217,50 +249,52 @@ class RetrainingScheduler(BaseAgent):
         target_drift = False
         top_features: List[str] = []
 
-        if drift_report:
+        if isinstance(drift_report, dict) and drift_report:
             try:
-                dd = drift_report.get("data_drift", {})
-                pct = float(dd.get("drift_score", 0.0))
-                drifted = dd.get("drifted_features", []) or []
-                top_features = list(drifted[:5])
-            except Exception:
-                pass
-            try:
-                td = drift_report.get("target_drift")
-                target_drift = bool(td and td.get("is_drift", False))
+                # Dopuszczamy kilka wariantów kluczy (elastyczność)
+                dd = drift_report.get("data_drift", drift_report.get("drift", {}))
+                if isinstance(dd, dict):
+                    # Obsługa alternatywnych nazw
+                    pct = float(
+                        dd.get("drift_score", dd.get("drift_pct", dd.get("pct_drifted_features", 0.0)))
+                    )
+                    drifted = dd.get("drifted_features", dd.get("top_drifted_features", [])) or []
+                    top_features = list(map(str, drifted[:5]))
+                td = drift_report.get("target_drift", {})
+                target_drift = bool(td.get("is_drift", td.get("drift", False)))
             except Exception:
                 pass
 
         return {
-            "pct": pct,                        # % cech z driftem
-            "target_drift": target_drift,      # drift targetu?
+            "pct": float(pct),                     # % cech z driftem
+            "target_drift": bool(target_drift),    # drift targetu?
             "top_features": top_features
         }
 
     def _extract_perf_signals(self, performance_data: Optional[Dict[str, Any]], problem_type: str) -> Dict[str, Any]:
+        """
+        performance_data: oczekujemy struktury z PerformanceTracker.execute().data
+        i węzłem .comparison[<primary_key>].delta
+        """
         primary_delta = 0.0  # dodatni = poprawa; ujemny = spadek
         detail: Dict[str, Any] = {}
-        if not performance_data:
-            return {"primary_delta": primary_delta, "detail": detail}
+        if not isinstance(performance_data, dict) or not performance_data:
+            return {"primary_delta": float(primary_delta), "detail": detail}
 
-        # performance_data powinno pochodzić z PerformanceTracker.execute().data
         comparison = performance_data.get("comparison")
         if not isinstance(comparison, dict):
-            return {"primary_delta": primary_delta, "detail": detail}
+            return {"primary_delta": float(primary_delta), "detail": detail}
 
-        if problem_type == "classification":
-            key = "accuracy"
-        else:
-            key = "r2"
-
+        key = "accuracy" if problem_type == "classification" else "r2"
         try:
             node = comparison.get(key, {})
             primary_delta = float(node.get("delta", 0.0))
+            # przekaż resztę porównań (np. rmse/mae)
             detail = {k: v for k, v in comparison.items() if isinstance(v, dict)}
         except Exception:
             pass
 
-        return {"primary_delta": primary_delta, "detail": detail}
+        return {"primary_delta": float(primary_delta), "detail": detail}
 
     def _model_age_days(self, model_path: Optional[str], last_train_ts: Optional[str]) -> int:
         # Ustal wiek modelu w dniach na podstawie mtime pliku albo last_train_ts (ISO)
@@ -283,19 +317,19 @@ class RetrainingScheduler(BaseAgent):
     # === SCORE & TRIGGERS ===
     def _compute_score(self, drift: Dict[str, Any], perf: Dict[str, Any], age_days: int) -> Tuple[float, Dict[str, float]]:
         pol = self.policy
-        # cząstkowe score w [0..1]
+        # drift: normalizacja do progu krytycznego
         drift_part = min(1.0, float(drift["pct"]) / max(pol.drift_crit_pct, 1e-9))
-        # performance – normalizuj wg dopuszczalnego spadku
+
+        # performance: osobno klasyfikacja vs. regresja;
+        # tutaj traktujemy delta <0 jako spadek — normalizujemy względem dopuszczalnego spadku.
         if perf["primary_delta"] >= 0:
             perf_part = 0.0
         else:
-            if pol.max_acc_drop_pct and pol.max_r2_drop_abs:
-                # odróżnimy typ w interpretacji w _extract_perf_signals
-                # tu uogólnimy: normalizujemy do 100 p.p. dla klasyfikacji, 1.0 dla R2
-                denom = 0.01 * pol.max_acc_drop_pct  # „dopuszczalny” spadek w ułamku
-                perf_part = min(1.0, abs(perf["primary_delta"]) / max(denom, 1e-9))
-            else:
-                perf_part = min(1.0, abs(perf["primary_delta"]) / 0.02)  # fallback 2 p.p.
+            # dla acc — delta jest w [0..1] jeśli pochodzi z PerformanceTracker; ale bywa interpretowana jako różnica bezwzględna.
+            # Bezpiecznie potraktujmy 0.01 * max_acc_drop_pct jako „dopuszczalny” spadek.
+            denom = max(1e-9, 0.01 * pol.max_acc_drop_pct if pol.max_acc_drop_pct else 0.02)
+            perf_part = min(1.0, abs(perf["primary_delta"]) / denom)
+
         # age
         if age_days < 0:
             age_part = 0.0
@@ -305,7 +339,7 @@ class RetrainingScheduler(BaseAgent):
             age_part = max(0.0, (age_days - pol.age_warn_days) / max(pol.age_crit_days - pol.age_warn_days, 1))
 
         score = pol.weight_drift * drift_part + pol.weight_perf * perf_part + pol.weight_age * age_part
-        parts = {"drift": drift_part, "performance": perf_part, "age": age_part}
+        parts = {"drift": round(float(drift_part), 6), "performance": round(float(perf_part), 6), "age": round(float(age_part), 6)}
         return float(score), parts
 
     def _priority_from_score(self, score: float) -> Literal["low", "medium", "high"]:
@@ -330,7 +364,7 @@ class RetrainingScheduler(BaseAgent):
             triggers.append("target_drift_detected")
             hard = True
 
-        # performance: w klasyfikacji interpretujemy delta w p.p.; w regresji — bezwzględny
+        # performance: delta < 0 (spadek)
         if perf["primary_delta"] < 0:
             triggers.append(f"performance_drop({perf['primary_delta']:.4f})")
 
@@ -379,11 +413,17 @@ class RetrainingScheduler(BaseAgent):
     def _now_local(self) -> datetime:
         tz = self.policy.timezone
         if ZoneInfo:
-            return datetime.now(ZoneInfo(tz))  # type: ignore
+            try:
+                return datetime.now(ZoneInfo(tz))  # type: ignore
+            except Exception:
+                pass
         # fallback UTC
         return datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    def _recommend_schedule(self) -> Tuple[str, str, Dict[str, Any]]:
+    def _recommend_schedule(self) -> Tuple[str, str, Dict[str, Any], str]:
+        """
+        Zwraca: (next_time_local_iso, cron, window_info, ical_vevent)
+        """
         now = self._now_local()
         hour = int(self.policy.preferred_hour)
         minute = int(self.policy.preferred_minute)
@@ -394,26 +434,39 @@ class RetrainingScheduler(BaseAgent):
         if candidate <= now:
             candidate += timedelta(days=1)
 
-        if dow is not None and len(dow) > 0:
-            # przesuwaj do dnia dozwolonego
-            while candidate.weekday() not in set(dow):
+        allowed = set(dow) if dow else None
+        if allowed:
+            while candidate.weekday() not in allowed:
                 candidate += timedelta(days=1)
 
-        # cron (DOW: Mon=1..Sun=0 lub 7 w cronie; my mamy Mon=0..Sun=6, więc mapujemy)
+        # cron (DOW: Sun=0, Mon=1, ... w standardowym cronie; my mamy Mon=0..Sun=6 → mapuj)
         cron_dow = "*"
-        if dow is not None and len(dow) > 0:
-            # Standard crona: 0–6 => Sun=0, Mon=1, ...; mapujemy nasze [0..6] na [1..6,0]
+        if dow and len(dow) > 0:
             cron_map = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 0}
-            cron_vals = sorted(cron_map[d] for d in dow)
+            cron_vals = sorted(cron_map[d] for d in dow if d in cron_map)
             cron_dow = ",".join(str(v) for v in cron_vals)
 
         cron = f"{minute} {hour} * * {cron_dow}"
-        return candidate.isoformat(), cron, {
+
+        window = {
             "hour": hour,
             "minute": minute,
             "days_of_week": dow if dow is not None else "daily",
             "timezone": self.policy.timezone
         }
+
+        # iCal VEVENT (jednorazowe zdarzenie; system może sam dodać RRULE jeśli potrzebne)
+        dtstart = candidate.strftime("%Y%m%dT%H%M%S")
+        tzid = self.policy.timezone if ZoneInfo else "UTC"
+        vevent = (
+            "BEGIN:VEVENT\n"
+            f"DTSTART;TZID={tzid}:{dtstart}\n"
+            f"SUMMARY:Model Retraining ({self.name})\n"
+            "DESCRIPTION:Recommended retraining window by RetrainingScheduler\n"
+            "END:VEVENT"
+        )
+
+        return candidate.isoformat(), cron, window, vevent
 
     # === OPCJONALNY NATYCHMIASTOWY RETRAIN ===
     def _run_immediate_retrain(
@@ -436,8 +489,6 @@ class RetrainingScheduler(BaseAgent):
         )
         ok = (hasattr(out, "is_success") and out.is_success()) or (isinstance(out, dict) and "ml_results" in out)
         payload = out.data if hasattr(out, "data") else (out if isinstance(out, dict) else None)
-
-        # Zapis w logu: sukces/porazka — realizowany w _append_log_record() przez status
         return bool(ok), payload
 
     # === LOGI / HISTORIA ===
@@ -445,6 +496,7 @@ class RetrainingScheduler(BaseAgent):
         df = pd.DataFrame([record])
         header_needed = not self.log_path.exists()
         try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(self.log_path, mode="a", header=header_needed, index=False, encoding="utf-8")
         except Exception as e:
             self.logger.warning(f"Failed to append retraining log: {e}")
@@ -458,3 +510,32 @@ class RetrainingScheduler(BaseAgent):
         except Exception as e:
             self.logger.warning(f"Failed to read retraining log: {e}")
             return pd.DataFrame()
+
+    # === UZASADNIENIE ===
+    def _build_reasoning(
+        self,
+        *,
+        should_retrain: bool,
+        score: float,
+        priority: str,
+        parts: Dict[str, float],
+        triggers: List[str],
+        cooldown_ok: bool,
+        weekly_ok: bool,
+        vol_ok: bool,
+        force: bool
+    ) -> str:
+        flags = []
+        if not cooldown_ok: flags.append("cooldown_not_elapsed")
+        if not weekly_ok: flags.append("weekly_limit_reached")
+        if not vol_ok: flags.append("insufficient_new_samples")
+        if force: flags.append("forced")
+
+        parts_str = ", ".join([f"{k}={v:.2f}" for k, v in parts.items()])
+        trig_str = ", ".join(triggers) if triggers else "none"
+        gate_str = "OK" if (cooldown_ok and weekly_ok and vol_ok) else ("BLOCKED: " + ", ".join(flags))
+
+        return (
+            f"score={score:.3f} (parts: {parts_str}), priority={priority}; "
+            f"triggers=[{trig_str}]; gates={gate_str}."
+        )
