@@ -28,7 +28,7 @@ Kontrakt (AgentResult.data):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, Tuple, Callable
+from typing import Dict, Any, Optional, List, Tuple
 
 import time
 import numpy as np
@@ -50,8 +50,8 @@ class EDAConfig:
     highcorr_warn_pairs: int = 3        # >3 par silnych korelacji = uwaga
     highcorr_threshold: float = 0.85    # próg silnej korelacji (|r| >=)
     # Limity/skalowalność
-    max_rows: int = 2_000_000           # miękki limit wierszy do pełnego EDA
-    max_cols: int = 2_000               # miękki limit kolumn do pełnego EDA
+    max_rows: int = 2_000_000           # miękki limit wierszy do pełnego EDA (informacyjny)
+    max_cols: int = 2_000               # miękki limit kolumn do pełnego EDA (informacyjny)
     enable_sampling: bool = True
     sample_rows: int = 200_000          # próbkuj dla bardzo dużych zbiorów
     random_state: int = 42
@@ -60,7 +60,7 @@ class EDAConfig:
     # Budżet czasu na pojedynczego agenta (miękki, informacyjny — nie ubija wątku, ale pozwala skipować następnych)
     soft_agent_time_budget_ms: int = 30_000
     # Fallback korelacji, jeśli dedykowany agent nie istnieje
-    fallback_corr_max_features: int = 200  # ograniczanie szerokości heatmapy w fallbacku
+    fallback_corr_max_features: int = 200  # ograniczanie szerokości heatmapy/fazy w fallbacku
 
 
 class EDAOrchestrator(PipelineAgent):
@@ -72,27 +72,27 @@ class EDAOrchestrator(PipelineAgent):
     def __init__(self, config: Optional[EDAConfig] = None) -> None:
         # Lazy import — unikamy ciężkich importów przy inicjalizacji pakietu
         try:
-            from agents.eda.statistical_analysis import StatisticalAnalyzer
-        except Exception:  # minimalny fallback
+            from agents.eda.statistical_analysis import StatisticalAnalyzer  # type: ignore
+        except Exception:
             StatisticalAnalyzer = None  # type: ignore
 
         try:
-            from agents.eda.visualization_engine import VisualizationEngine
+            from agents.eda.visualization_engine import VisualizationEngine  # type: ignore
         except Exception:
             VisualizationEngine = None  # type: ignore
 
         try:
-            from agents.eda.missing_data_analyzer import MissingDataAnalyzer
+            from agents.eda.missing_data_analyzer import MissingDataAnalyzer  # type: ignore
         except Exception:
             MissingDataAnalyzer = None  # type: ignore
 
         try:
-            from agents.eda.outlier_detector import OutlierDetector
+            from agents.eda.outlier_detector import OutlierDetector  # type: ignore
         except Exception:
             OutlierDetector = None  # type: ignore
 
         try:
-            from agents.eda.correlation_analyzer import CorrelationAnalyzer
+            from agents.eda.correlation_analyzer import CorrelationAnalyzer  # type: ignore
         except Exception:
             CorrelationAnalyzer = None  # type: ignore
 
@@ -164,7 +164,11 @@ class EDAOrchestrator(PipelineAgent):
             sampled = True
             sample_info = {"from_rows": int(len(df)), "to_rows": int(cfg.sample_rows)}
             self.logger.info(f"Sampling EDA: {len(df)} → {cfg.sample_rows} rows (random_state={cfg.random_state})")
-            df = df.sample(n=cfg.sample_rows, random_state=cfg.random_state)
+            try:
+                df = df.sample(n=cfg.sample_rows, random_state=cfg.random_state)
+            except Exception as e:
+                # Jeśli sampling zawiedzie, pracujemy na pełnym zbiorze — tylko ostrzegaj
+                self.logger.warning(f"Sampling failed, processing full dataset. Reason: {e}")
 
         # Guard na skrajnie szerokie zbiory (informacyjny)
         if df.shape[1] > cfg.max_cols:
@@ -178,8 +182,9 @@ class EDAOrchestrator(PipelineAgent):
         eda_results: Dict[str, Any] = {}
         elapsed_total_ms = 0.0
 
-        for agent in self.agents:
+        for idx, agent in enumerate(self.agents):
             agent_name = getattr(agent, "name", agent.__class__.__name__)
+
             # Jeśli przekroczyliśmy miękki budżet całkowity — skip resztę
             elapsed_total_ms = (time.perf_counter() - t0_total) * 1000
             if elapsed_total_ms > cfg.soft_total_time_budget_ms:
@@ -187,8 +192,7 @@ class EDAOrchestrator(PipelineAgent):
                     f"Soft total time budget exceeded ({elapsed_total_ms:.1f}ms > {cfg.soft_total_time_budget_ms}ms). "
                     f"Skipping remaining agents."
                 )
-                # zaznacz pozostałych jako pominiętych
-                remaining = [getattr(a, "name", a.__class__.__name__) for a in self.agents[self.agents.index(agent):]]
+                remaining = [getattr(a, "name", a.__class__.__name__) for a in self.agents[idx:]]
                 skipped_agents.extend(remaining)
                 break
 
@@ -197,16 +201,15 @@ class EDAOrchestrator(PipelineAgent):
             agent_errs: List[str] = []
 
             try:
-                # przekazujemy target_column w kwargs, ale nie wszystkie agenty muszą go użyć
+                # Przekazujemy target_column w kwargs (idempotentnie)
                 agent_result: AgentResult = agent.execute(
                     data=df,
                     target_column=target_column,
                     **kwargs
                 )
-                elapsed_ms = (time.perf_counter() - t_agent) * 1000
+                elapsed_ms = (time.perf_counter() - t_agent) * 1000.0
                 telem_timings[agent_name] = round(elapsed_ms, 1)
 
-                # Obsługa błędów raportowanych przez agenta — zachowujemy dane o ile są
                 if agent_result.errors:
                     agent_errs.extend([str(e) for e in agent_result.errors])
                     self.logger.warning(f"{agent_name} reported errors: {agent_result.errors}")
@@ -221,11 +224,10 @@ class EDAOrchestrator(PipelineAgent):
                     )
 
             except Exception as e:
-                # Agent zawiódł — nie przerywamy, zapisujemy błąd i idziemy dalej
-                elapsed_ms = (time.perf_counter() - t_agent) * 1000
+                elapsed_ms = (time.perf_counter() - t_agent) * 1000.0
                 telem_timings[agent_name] = round(elapsed_ms, 1)
                 err_msg = f"Agent '{agent_name}' failed: {e}"
-                self.logger.error(err_msg, exc_info=True)
+                self.logger.error(err_msg)
                 agent_errs.append(err_msg)
                 # placeholder, aby downstream miał klucz
                 eda_results[agent_name] = {"_skipped": True, "_error": str(e)}
@@ -239,11 +241,11 @@ class EDAOrchestrator(PipelineAgent):
                 self.logger.info("Running lightweight fallback correlation analysis…")
                 t_fallback = time.perf_counter()
                 eda_results["CorrelationAnalyzer"] = self._fallback_correlation(df, target_column)
-                telem_timings.setdefault("CorrelationAnalyzer(fallback)", round((time.perf_counter() - t_fallback) * 1000, 1))
+                telem_timings["CorrelationAnalyzer(fallback)"] = round((time.perf_counter() - t_fallback) * 1000.0, 1)
             except Exception as e:
                 self.logger.warning(f"Fallback correlation failed: {e}")
 
-        telem_timings["_total"] = round((time.perf_counter() - t0_total) * 1000, 1)
+        telem_timings["_total"] = round((time.perf_counter() - t0_total) * 1000.0, 1)
 
         # Zbuduj podsumowanie (na bazie oryginalnego df, nie próbki)
         try:
@@ -298,20 +300,22 @@ class EDAOrchestrator(PipelineAgent):
 
         # ogranicz funkcjami wariancji, żeby nie wybuchać pamięciowo
         if len(num_cols) > cfg.fallback_corr_max_features:
-            variances = df[num_cols].var(numeric_only=True).sort_values(ascending=False)
-            keep = variances.head(cfg.fallback_corr_max_features).index
-            num_cols = list(keep)
+            try:
+                variances = df[num_cols].var(numeric_only=True).sort_values(ascending=False)
+                keep = variances.head(cfg.fallback_corr_max_features).index
+                num_cols = list(keep)
+            except Exception:
+                num_cols = num_cols[: cfg.fallback_corr_max_features]
 
         corr = df[num_cols].corr(numeric_only=True).abs()
-        # zbierz pary i posortuj
-        pairs = []
+        pairs: List[Tuple[str, str, float]] = []
         for i in range(len(num_cols)):
             for j in range(i + 1, len(num_cols)):
-                r = corr.iloc[i, j]
+                r = float(corr.iloc[i, j])
                 if np.isfinite(r) and r >= cfg.highcorr_threshold:
-                    pairs.append((num_cols[i], num_cols[j], float(r)))
+                    pairs.append((num_cols[i], num_cols[j], r))
         pairs.sort(key=lambda x: x[2], reverse=True)
-        out["high_correlations"] = [{"feature_1": a, "feature_2": b, "corr_abs": r} for a, b, r in pairs]
+        out["high_correlations"] = [{"feature_1": a, "feature_2": b, "corr_abs": float(r)} for a, b, r in pairs]
 
         # target correlations
         if target_column and target_column in df.columns and pd.api.types.is_numeric_dtype(df[target_column]):
@@ -357,16 +361,13 @@ class EDAOrchestrator(PipelineAgent):
         missing_pct = 0.0
         md = eda_results.get("MissingDataAnalyzer")
         if isinstance(md, dict):
-            # obsłuż różne nazwy pól (Twoje wcześniejsze moduły: 'missing_percentage')
             s = md.get("summary", {}) or {}
             total_missing = int(s.get("total_missing", s.get("total_missing_values", 0)) or 0)
-            # preferuj 'missing_percentage' jeżeli jest, inaczej spróbuj policzyć
             missing_pct = float(s.get("missing_percentage", s.get("pct_missing", 0.0)) or 0.0)
             if not missing_pct and rows * cols > 0:
                 missing_pct = (total_missing / (rows * cols)) * 100.0
             if total_missing > 0:
                 key_findings.append(f"Braki: {total_missing} pól (~{missing_pct:.1f}%).")
-                # Zbierz rekomendacje z agenta, jeżeli są
                 recs = md.get("recommendations") or []
                 recommendations.extend([str(r) for r in recs][:3])
 
@@ -396,7 +397,7 @@ class EDAOrchestrator(PipelineAgent):
             if top_feats:
                 key_findings.append(f"Najsilniej skorelowane z targetem: {', '.join(map(str, top_feats[:3]))}.")
 
-        # 5) Statystyki
+        # 5) Statystyki (opcjonalny agent)
         sa = eda_results.get("StatisticalAnalyzer")
         if isinstance(sa, dict):
             overall = sa.get("overall", {}) or {}
@@ -405,7 +406,6 @@ class EDAOrchestrator(PipelineAgent):
                 key_findings.append(f"Wysoka rzadkość (sparsity): ~{float(sparsity)*100:.1f}% braków/zer.")
                 recommendations.append("Rozważ redukcję wymiaru / rzadkie kodowania lub modele odporne na rzadkość.")
 
-            # dodaj krótkie wskazówki dot. rozkładów
             dist = sa.get("distributions", {}) or {}
             heavy = [c for c, d in dist.items() if d.get("heavy_tails")]
             skewed = [c for c, d in dist.items() if d.get("high_skewness")]
@@ -424,8 +424,7 @@ class EDAOrchestrator(PipelineAgent):
             cfg=cfg
         )
 
-        # Dedup rekomendacji (kolejność zachowana)
-        recommendations = list(dict.fromkeys([r for r in recommendations if r]))
+        recommendations = list(dict.fromkeys([r for r in recommendations if r]))  # dedupe
 
         return {
             "dataset_shape": (rows, cols),
@@ -449,18 +448,15 @@ class EDAOrchestrator(PipelineAgent):
         Zwraca (ocena_quality, severity_score).
         severity_score ∈ [0,1], gdzie 0 = idealnie, 1 = źle.
         """
-        # Normalizowane składniki
         comp: List[float] = []
 
         # Missingness (skala do 1)
-        miss_norm = 0.0
         if missing_pct >= cfg.missing_bad_pct:
             miss_norm = 1.0
         elif missing_pct >= cfg.missing_warn_pct:
             miss_norm = 0.5 + 0.5 * ((missing_pct - cfg.missing_warn_pct) / max(1e-9, (cfg.missing_bad_pct - cfg.missing_warn_pct)))
         else:
-            miss_norm = missing_pct / max(1.0, cfg.missing_warn_pct)
-            miss_norm = min(miss_norm, 0.5)  # poniżej progu traktujmy łagodnie
+            miss_norm = min(missing_pct / max(1.0, cfg.missing_warn_pct), 0.5)
         comp.append(float(np.clip(miss_norm, 0.0, 1.0)))
 
         # Outliers ratio
@@ -470,8 +466,7 @@ class EDAOrchestrator(PipelineAgent):
         elif out_ratio >= cfg.outliers_warn_ratio:
             out_norm = 0.5 + 0.5 * ((out_ratio - cfg.outliers_warn_ratio) / max(1e-9, cfg.outliers_warn_ratio))
         else:
-            out_norm = out_ratio / max(1e-9, cfg.outliers_warn_ratio)
-            out_norm = min(out_norm, 0.5)
+            out_norm = min(out_ratio / max(1e-9, cfg.outliers_warn_ratio), 0.5)
         comp.append(float(np.clip(out_norm, 0.0, 1.0)))
 
         # High correlations count
@@ -480,14 +475,11 @@ class EDAOrchestrator(PipelineAgent):
         elif n_high_corr_pairs >= cfg.highcorr_warn_pairs:
             corr_norm = 0.5 + 0.5 * ((n_high_corr_pairs - cfg.highcorr_warn_pairs) / max(1, cfg.highcorr_warn_pairs))
         else:
-            corr_norm = n_high_corr_pairs / max(1, cfg.highcorr_warn_pairs)
-            corr_norm = min(corr_norm, 0.5)
+            corr_norm = min(n_high_corr_pairs / max(1, cfg.highcorr_warn_pairs), 0.5)
         comp.append(float(np.clip(corr_norm, 0.0, 1.0)))
 
-        # Średnia ważona (tu równe wagi 1/3)
         severity = float(np.mean(comp)) if comp else 0.0
 
-        # Mapowanie jakości
         if severity < 0.2:
             quality = "excellent"
         elif severity < 0.4:

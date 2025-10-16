@@ -1,6 +1,6 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Data Profiler (PRO++++)
+DataGenius PRO - Data Profiler (PRO++++++++++)
 Kompleksowe profilowanie danych i ocena jakości datasetu.
 
 Wyjściowy kontrakt (dict):
@@ -18,7 +18,7 @@ Wyjściowy kontrakt (dict):
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Any, Optional, Tuple, Literal, Callable
+from typing import Dict, List, Any, Optional, Tuple, Literal, Callable, Iterable
 from pathlib import Path
 import time
 import hashlib
@@ -46,13 +46,15 @@ class ProfilerConfig:
     duplicates_row_ratio_mid: float = 0.10     # >10% => severity "medium"
     corr_abs_threshold:       float = 0.80     # wysokie korelacje
     max_corr_rows:            int   = 200_000  # sampling safety dla korelacji
-    corr_nan_policy:          str   = "pairwise"  # "pairwise" | "drop" (kolumny z NA)
+    corr_nan_policy:          Literal["pairwise","drop"] = "pairwise"  # polityka braków
     text_heavy_avg_len:       int   = 64       # średnia długość tekstu powyżej -> text_heavy
     id_like_unique_ratio:     float = 0.98     # >98% unikalnych vs N → id_like
     max_corr_cols:            int   = 200      # miękki limit liczby kolumn do korelacji (O(k^2))
     round_corr:               int   = 6        # precyzja zaokrągleń korelacji
     enable_mixed_type_check:  bool  = True     # wykrywanie „mieszanych” w kolumnie object
     include_dataset_hash:     bool  = True     # sygnatura wejścia w statistical_profile
+    corr_method:              Literal["pearson","spearman"] = "pearson"  # metoda korelacji
+    object_datetime_parse_ratio: float = 0.95  # jeśli >95% parsowalne → traktuj jako datetime (heurystyka, kopia kolumny)
 
 
 # === NAZWA_SEKCJI === MODELE DANYCH (profil statystyczny) ===
@@ -111,15 +113,38 @@ def _truncate(obj: Any, limit: int = 400) -> str:
     return s if len(s) <= limit else s[:limit] + f"...(+{len(s)-limit} chars)"
 
 
+def _coerce_object_datetime_like(s: pd.Series, parse_ratio: float) -> Tuple[pd.Series, bool]:
+    """
+    Heurystycznie sprawdza, czy kolumna object jest „datopodobna”.
+    Jeśli > parse_ratio wartości parsowalne do datetime → zwraca skopiowaną, sparsowaną serię i True.
+    W przeciwnym razie zwraca oryginał i False. Zero side-effectów na oryginalnym df.
+    """
+    if s.dtype != "object":
+        return s, False
+    try:
+        sample = s.dropna().astype(str)
+        if sample.empty:
+            return s, False
+        parsed = pd.to_datetime(sample, errors="coerce", utc=False)
+        ratio = float(parsed.notna().mean())
+        if ratio >= parse_ratio:
+            # parsujemy całą kolumnę na kopii
+            parsed_full = pd.to_datetime(s.astype(str), errors="coerce", utc=False)
+            return parsed_full, True
+        return s, False
+    except Exception:
+        return s, False
+
+
 # === NAZWA_SEKCJI === KLASA GŁÓWNA AGENDA ===
 class DataProfiler(BaseAgent):
     """
-    Agent profilujący dane (PRO++++):
+    Agent profilujący dane (PRO++++++++++):
     - Jakość danych (score + szczegóły) z DataValidator
     - Profil statystyczny + meta (w tym dataset_hash opcjonalnie)
-    - Problemy jakości (braki, stałość, kwazi-stałość, kardynalność, duplikaty, outliery, id-like, mixed-type, text-heavy)
+    - Problemy jakości (braki, stałe, kwazi-stałe, kardynalność, duplikaty, outliery, id-like, mixed-type, text-heavy)
     - Charakterystyki cech
-    - Korelacje numeryczne (bezpiecznie i wydajnie)
+    - Korelacje numeryczne (bezpiecznie i wydajnie; pearson/spearman; higiena NaN/inf)
     """
 
     def __init__(self, config: Optional[ProfilerConfig] = None) -> None:
@@ -208,7 +233,18 @@ class DataProfiler(BaseAgent):
         # Dtypes
         num_cols = df.select_dtypes(include=[np.number]).columns
         cat_cols = df.select_dtypes(include=["object", "category"]).columns
-        dt_cols  = df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns
+
+        # Heurystyczna detekcja dat w object (na kopiach serii — bez modyfikacji df)
+        dt_like_cols: List[str] = []
+        for col in df.columns:
+            s = df[col]
+            if pd.api.types.is_datetime64_any_dtype(s):
+                dt_like_cols.append(str(col))
+                continue
+            if s.dtype == "object":
+                _, is_dt = _coerce_object_datetime_like(s, self.config.object_datetime_parse_ratio)
+                if is_dt:
+                    dt_like_cols.append(str(col))
 
         # Pamięć
         try:
@@ -239,7 +275,7 @@ class DataProfiler(BaseAgent):
             n_columns=n_cols,
             n_numeric=int(len(num_cols)),
             n_categorical=int(len(cat_cols)),
-            n_datetime=int(len(dt_cols)),
+            n_datetime=int(len(dt_like_cols)),
             memory_mb=memory_mb,
             duplicates={"n_duplicates": n_dup, "pct_duplicates": pct_dup},
             missing_data={
@@ -396,17 +432,26 @@ class DataProfiler(BaseAgent):
                     "avg_len": avg_len,
                 })
 
-        # Datetime monotonicity (częste w szeregach czasowych)
-        for col in df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns:
-            s = df[col].dropna()
-            if len(s) > 1:
-                if s.is_monotonic_increasing or s.is_monotonic_decreasing:
-                    issues.append({
-                        "type": "datetime_monotonic",
-                        "severity": "info",
-                        "column": str(col),
-                        "description": f"Kolumna '{col}' jest monotoniczna (czasowo).",
-                    })
+        # Datetime monotonicity (częste w szeregach czasowych; wykrywa też object→datetime heurystycznie)
+        for col in df.columns:
+            s = df[col]
+            if pd.api.types.is_datetime64_any_dtype(s):
+                sdt = s.dropna()
+            elif s.dtype == "object":
+                coerced, is_dt = _coerce_object_datetime_like(s, self.config.object_datetime_parse_ratio)
+                if not is_dt:
+                    continue
+                sdt = coerced.dropna()
+            else:
+                continue
+
+            if len(sdt) > 1 and (sdt.is_monotonic_increasing or sdt.is_monotonic_decreasing):
+                issues.append({
+                    "type": "datetime_monotonic",
+                    "severity": "info",
+                    "column": str(col),
+                    "description": f"Kolumna '{col}' jest monotoniczna (czasowo).",
+                })
 
         return issues
 
@@ -431,11 +476,17 @@ class DataProfiler(BaseAgent):
         for col in df.columns:
             s = df[col]
 
-            # Typ
+            # Typ (uwzględnij object→datetime heurystycznie)
             if pd.api.types.is_numeric_dtype(s):
                 ch["numeric"].append(str(col))
             elif pd.api.types.is_datetime64_any_dtype(s):
                 ch["datetime"].append(str(col))
+            elif s.dtype == "object":
+                _, is_dt = _coerce_object_datetime_like(s, self.config.object_datetime_parse_ratio)
+                if is_dt:
+                    ch["datetime"].append(str(col))
+                else:
+                    ch["categorical"].append(str(col))
             else:
                 ch["categorical"].append(str(col))
 
@@ -462,8 +513,11 @@ class DataProfiler(BaseAgent):
                 pass
 
             # Braki
-            if len(df) > 0 and (int(s.isna().sum()) > cfg.high_missing_flag_threshold * len(df)):
-                ch["high_missing"].append(str(col))
+            try:
+                if len(df) > 0 and (int(s.isna().sum()) > cfg.high_missing_flag_threshold * len(df)):
+                    ch["high_missing"].append(str(col))
+            except Exception:
+                pass
 
             # id_like
             if len(df) > 0 and (n_unique / len(df)) >= cfg.id_like_unique_ratio:
@@ -485,6 +539,8 @@ class DataProfiler(BaseAgent):
         - Bezpieczne próbkowanie przy bardzo dużych danych.
         - Limit kolumn (O(k^2)) do obliczeń macierzy.
         - Wysokie korelacje > cfg.corr_abs_threshold.
+        - Metody: pearson/spearman (konfig).
+        - Higiena NaN/inf (zastępowanie na potrzeby corr, bez modyfikacji df).
         """
         cfg = self.config
         num_cols_all = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -507,13 +563,28 @@ class DataProfiler(BaseAgent):
         # Polityka braków
         if cfg.corr_nan_policy == "drop":
             df_corr = df_corr.dropna()
-        # "pairwise": pandas corr(method='pearson') poradzi sobie pairwise
 
+        # Jeśli pozostał pusto/słabo – przerwij
         if df_corr.empty or len(df_corr.columns) < 2:
             return {"n_numeric_features": len(num_cols), "correlation_matrix": None, "high_correlations": [], "n_high_correlations": 0}
 
-        corr_matrix = df_corr.corr(numeric_only=True)  # pearson domyślnie
-        corr_matrix = corr_matrix.round(cfg.round_corr)
+        # Higiena inf/NaN: do obliczeń korelacji zastępujemy +/-inf → NaN, potem pairwise/dropping
+        df_corr = df_corr.replace([np.inf, -np.inf], np.nan)
+
+        # Obliczanie korelacji
+        try:
+            corr_matrix = df_corr.corr(method=cfg.corr_method, numeric_only=True)
+        except Exception:
+            # awaryjnie: pearson
+            corr_matrix = df_corr.corr(method="pearson", numeric_only=True)
+
+        if cfg.corr_nan_policy == "drop":
+            corr_matrix = corr_matrix.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+        if corr_matrix.empty or corr_matrix.shape[1] < 2:
+            return {"n_numeric_features": len(num_cols), "correlation_matrix": None, "high_correlations": [], "n_high_correlations": 0}
+
+        corr_matrix = corr_matrix.fillna(0.0).clip(-1.0, 1.0).round(cfg.round_corr)
 
         # Wyszukiwanie wysokich korelacji
         high_corr: List[Dict[str, Any]] = []

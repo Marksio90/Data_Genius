@@ -1,8 +1,16 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Statistical Analyzer (PRO++++)
+DataGenius PRO++++++ - Statistical Analyzer (Enterprise)
 Kompleksowa analiza statystyczna: metryki globalne, cechy numeryczne/kategoryczne,
-analiza rozkładów i zwięzłe rekomendacje dla EDA/modelowania + telemetry.
+analiza rozkładów (normalność + heurystyka kształtu), zwięzłe rekomendacje,
+telemetria i enterprise-guardy wydajnościowe.
+
+Cechy ENTERPRISE:
+- twarde i miękkie guardy: sampling, caps na liczbę kolumn, minimalna liczność, odporność na NaN/Inf
+- stabilny kontrakt danych (zgodny z PRO++++) + rozsądne rozszerzenia telemetry (caps/skips)
+- defensywne obliczenia (NA-safe), zero side-effectów na wejściowym DataFrame
+- metryki jakości kolumn (zero variance, near-constant, CV, monotoniczność)
+- normalność: Shapiro (małe N), D’Agostino K² (duże N), fallback Anderson–Darling
 
 Kontrakt (AgentResult.data):
 {
@@ -48,8 +56,14 @@ Kontrakt (AgentResult.data):
       "n_zero_variance": int, "n_near_constant": int, "n_high_cv": int,
       "n_high_cardinality": int, "n_dominant_categorical": int
   },
-  "telemetry": {"elapsed_ms": float, "timings_ms": {"overall": float, "numeric": float, "categorical": float, "distributions": float},
-                "sampled_for_tests": bool, "sample_info": {"from_rows": int, "to_rows": int}|None}
+  "telemetry": {
+      "elapsed_ms": float,
+      "timings_ms": {"overall": float, "numeric": float, "categorical": float, "distributions": float},
+      "sampled_for_tests": bool, "sample_info": {"from_rows": int, "to_rows": int}|None,
+      "caps": {"numeric_cols_total": int, "numeric_cols_used": int, "numeric_cols_cap": int,
+               "categorical_cols_total": int, "categorical_cols_used": int, "categorical_cols_cap": int},
+      "skipped_columns": {"numeric_empty": List[str], "categorical_empty": List[str]}
+  }
 }
 """
 
@@ -70,22 +84,33 @@ from core.base_agent import BaseAgent, AgentResult
 # === NAZWA_SEKCJI === KONFIG / PROGI HEURYSTYCZNE ===
 @dataclass(frozen=True)
 class StatsConfig:
-    normality_alpha: float = 0.05           # próg istotności dla testów normalności
-    max_shapiro_n: int = 5_000              # Shapiro tylko do tej liczby obserwacji
-    high_cardinality_threshold: int = 50    # >50 unikatów → high cardinality
-    skew_high_abs: float = 1.0              # |skew| > 1 → silna skośność
-    kurt_high_abs: float = 3.0              # |excess kurtosis| > 3 → ciężkie ogony
-    cv_warn: float = 1.0                    # CV > 1 → duża zmienność (poza zero mean)
-    top_k_values: int = 5                   # ile top wartości dla kategorii
-    near_constant_ratio: float = 0.98       # >=98% tej samej wartości → near-constant
-    max_rows_for_tests: int = 300_000       # sampling safety dla testów normalności
+    # — normalność —
+    normality_alpha: float = 0.05            # próg istotności dla testów normalności
+    max_shapiro_n: int = 5_000               # Shapiro tylko do tej liczby obserwacji
+    max_rows_for_tests: int = 300_000        # sampling safety dla testów normalności
     random_state: int = 42
+    # — progi/heurystyki —
+    high_cardinality_threshold: int = 50     # >50 unikatów → high cardinality
+    skew_high_abs: float = 1.0               # |skew| > 1 → silna skośność
+    kurt_high_abs: float = 3.0               # |excess kurtosis| > 3 → ciężkie ogony
+    cv_warn: float = 1.0                     # CV > 1 → duża zmienność (poza zero mean)
+    top_k_values: int = 5                    # ile top wartości dla kategorii
+    near_constant_ratio: float = 0.98        # >=98% tej samej wartości → near-constant
+    # — caps / guardy —
+    min_non_na_numeric: int = 3              # min liczność do obliczeń numerycznych
+    min_non_na_categorical: int = 3          # min liczność do statystyk kategorii
+    max_numeric_cols: int = 3000             # miękki limit liczby kolumn numerycznych
+    max_categorical_cols: int = 3000         # miękki limit liczby kolumn kategorycznych
+    # — przetwarzanie —
+    strip_object_whitespace: bool = True     # przytnij spacje w object
+    replace_empty_string_with_nan: bool = True
 
 
 # === NAZWA_SEKCJI === KLASA GŁÓWNA ===
 class StatisticalAnalyzer(BaseAgent):
     """
-    Comprehensive statistical analysis agent (PRO++++): defensywnie, szybko, ze spójnym kontraktem i telemetry.
+    Comprehensive statistical analysis agent (PRO++++++/Enterprise):
+    defensywnie, szybko, ze spójnym kontraktem i telemetry.
     """
 
     def __init__(self, config: Optional[StatsConfig] = None) -> None:
@@ -97,6 +122,9 @@ class StatisticalAnalyzer(BaseAgent):
     def execute(self, data: pd.DataFrame, **kwargs) -> AgentResult:
         """
         Perform statistical analysis with defensive guards and telemetry.
+        Optional kwargs (nie zmieniają kontraktu):
+            include_numeric: Optional[List[str]]     — biały filtr kolumn numerycznych
+            include_categorical: Optional[List[str]] — biały filtr kolumn kategorycznych
         """
         result = AgentResult(agent_name=self.name)
         t0_total = time.perf_counter()
@@ -114,26 +142,46 @@ class StatisticalAnalyzer(BaseAgent):
                 result.data["telemetry"]["elapsed_ms"] = round((time.perf_counter() - t0_total) * 1000, 1)
                 return result
 
-            df = data.replace([np.inf, -np.inf], np.nan)
+            cfg = self.config
+            df = data.copy()
+
+            # Pre-clean (lekko): Inf→NaN, opcjonalnie trim stringów i ""→NaN
+            df = df.replace([np.inf, -np.inf], np.nan)
+            if cfg.strip_object_whitespace:
+                try:
+                    obj_cols = df.select_dtypes(include=["object"]).columns
+                    if len(obj_cols) > 0:
+                        df[obj_cols] = df[obj_cols].apply(lambda s: s.astype("object").str.strip())
+                except Exception:
+                    pass
+            if cfg.replace_empty_string_with_nan:
+                try:
+                    obj_cols = df.select_dtypes(include=["object"]).columns
+                    if len(obj_cols) > 0:
+                        df[obj_cols] = df[obj_cols].replace("", np.nan)
+                except Exception:
+                    pass
 
             # 1) Overall
             t0 = time.perf_counter()
             overall_stats = self._get_overall_statistics(df)
             t_overall = (time.perf_counter() - t0) * 1000
 
-            # 2) Numeric
+            # 2) Numeric (z caps/guardami)
             t0 = time.perf_counter()
-            numeric_stats = self._analyze_numeric_features(df)
+            num_df, num_caps_meta = self._select_numeric(df, kwargs.get("include_numeric"))
+            numeric_stats = self._analyze_numeric_features(num_df)
             t_numeric = (time.perf_counter() - t0) * 1000
 
-            # 3) Categorical
+            # 3) Categorical (z caps/guardami)
             t0 = time.perf_counter()
-            categorical_stats = self._analyze_categorical_features(df)
+            cat_df, cat_caps_meta = self._select_categorical(df, kwargs.get("include_categorical"))
+            categorical_stats = self._analyze_categorical_features(cat_df)
             t_categorical = (time.perf_counter() - t0) * 1000
 
-            # 4) Distributions (z samplingiem dla bardzo dużych zbiorów)
+            # 4) Distributions (na bazie num_df + sampling do testów)
             t0 = time.perf_counter()
-            dist_df, sampled, sample_info = self._maybe_sample_for_tests(df)
+            dist_df, sampled, sample_info = self._maybe_sample_for_tests(num_df)
             distributions = self._analyze_distributions(dist_df)
             t_distributions = (time.perf_counter() - t0) * 1000
 
@@ -170,7 +218,19 @@ class StatisticalAnalyzer(BaseAgent):
                         "distributions": round(t_distributions, 1),
                     },
                     "sampled_for_tests": bool(sampled),
-                    "sample_info": sample_info
+                    "sample_info": sample_info,
+                    "caps": {
+                        "numeric_cols_total": num_caps_meta["caps"]["total"],
+                        "numeric_cols_used": num_caps_meta["caps"]["used"],
+                        "numeric_cols_cap": num_caps_meta["caps"]["cap"],
+                        "categorical_cols_total": cat_caps_meta["caps"]["total"],
+                        "categorical_cols_used": cat_caps_meta["caps"]["used"],
+                        "categorical_cols_cap": cat_caps_meta["caps"]["cap"],
+                    },
+                    "skipped_columns": {
+                        "numeric_empty": num_caps_meta["skipped_empty"],
+                        "categorical_empty": cat_caps_meta["skipped_empty"],
+                    }
                 }
             }
 
@@ -204,10 +264,61 @@ class StatisticalAnalyzer(BaseAgent):
             "sparsity": sparsity,
         }
 
-    # === NAZWA_SEKCJI === NUMERYCZNE ===
+    # === NAZWA_SEKCJI === WYBÓR KOLUMN (NUM & CAT) Z GUARDAMI ===
+    def _select_numeric(self, df: pd.DataFrame, include: Optional[List[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        cfg = self.config
+        num = df.select_dtypes(include=[np.number])
+        total = int(num.shape[1])
+
+        if include:
+            keep = [c for c in include if c in num.columns]
+            num = num.loc[:, keep]
+
+        # Cap liczby kolumn
+        used_cols = num.columns[: cfg.max_numeric_cols]
+        capped = num.shape[1] > cfg.max_numeric_cols
+        num = num.loc[:, used_cols]
+
+        # Puste (brak >= min_non_na)
+        skipped_empty = []
+        for c in list(num.columns):
+            if num[c].count() < cfg.min_non_na_numeric:
+                skipped_empty.append(c)
+                num = num.drop(columns=[c])
+
+        meta = {"caps": {"total": total, "used": int(num.shape[1]), "cap": int(cfg.max_numeric_cols if capped else num.shape[1])},
+                "skipped_empty": skipped_empty}
+        return num, meta
+
+    def _select_categorical(self, df: pd.DataFrame, include: Optional[List[str]]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        cfg = self.config
+        cat = df.select_dtypes(include=["object", "category"])
+        total = int(cat.shape[1])
+
+        if include:
+            keep = [c for c in include if c in cat.columns]
+            cat = cat.loc[:, keep]
+
+        # Cap liczby kolumn
+        used_cols = cat.columns[: cfg.max_categorical_cols]
+        capped = cat.shape[1] > cfg.max_categorical_cols
+        cat = cat.loc[:, used_cols]
+
+        # Puste (brak >= min_non_na)
+        skipped_empty = []
+        for c in list(cat.columns):
+            if cat[c].count() < cfg.min_non_na_categorical:
+                skipped_empty.append(c)
+                cat = cat.drop(columns=[c])
+
+        meta = {"caps": {"total": total, "used": int(cat.shape[1]), "cap": int(cfg.max_categorical_cols if capped else cat.shape[1])},
+                "skipped_empty": skipped_empty}
+        return cat, meta
+
+    # === NAZWASEKCJI === NUMERYCZNE ===
     def _analyze_numeric_features(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Analyze numeric features (robust, NA-safe, z percentylami i flagami jakości)."""
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        num_cols = df.columns.tolist()
         if len(num_cols) == 0:
             return {"n_features": 0, "features": {}, "summary": {"message": "No numeric features found"}}
 
@@ -219,9 +330,10 @@ class StatisticalAnalyzer(BaseAgent):
         for col in num_cols:
             s = pd.to_numeric(df[col], errors="coerce")
             s_nona = s.dropna()
-            if s_nona.empty:
+            if len(s_nona) < self.config.min_non_na_numeric:
                 continue
 
+            # Podstawowe statystyki
             mean = float(s_nona.mean())
             std = float(s_nona.std(ddof=1)) if len(s_nona) > 1 else 0.0
             q01 = float(s_nona.quantile(0.01))
@@ -243,7 +355,6 @@ class StatisticalAnalyzer(BaseAgent):
             if zero_var:
                 zero_vars.append(col)
 
-            # near-constant: dominująca wartość >= near_constant_ratio
             mode_freq = int(s_nona.value_counts(dropna=False).iloc[0])
             near_constant_flag = bool((mode_freq / max(1, len(s_nona))) >= self.config.near_constant_ratio)
             if near_constant_flag and not zero_var:
@@ -252,7 +363,7 @@ class StatisticalAnalyzer(BaseAgent):
             if cv is not None and cv > self.config.cv_warn:
                 high_cv_cols.append(col)
 
-            # monotonic check
+            # Monotoniczność
             monotonic = None
             try:
                 if s_nona.is_monotonic_increasing:
@@ -298,7 +409,6 @@ class StatisticalAnalyzer(BaseAgent):
         if not features_stats:
             return {}
         variances = {k: v.get("variance", 0.0) for k, v in features_stats.items()}
-        # filtry, bo mogą istnieć kolumny bez variance w słowniku (puste po NA)
         non_empty_var = {k: v for k, v in variances.items() if v is not None}
         highest = max(non_empty_var, key=non_empty_var.get) if non_empty_var else None
         lowest = min(non_empty_var, key=non_empty_var.get) if non_empty_var else None
@@ -313,10 +423,10 @@ class StatisticalAnalyzer(BaseAgent):
             "high_cv_features": high_cv_cols,
         }
 
-    # === NAZWA_SEKCJI === KATEGORYCZNE ===
+    # === NAZWA SEKCJI === KATEGORYCZNE ===
     def _analyze_categorical_features(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Analyze categorical features with top-k, kardynalnością i dominacją."""
-        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        cat_cols = df.columns.tolist()
         if len(cat_cols) == 0:
             return {"n_features": 0, "features": {}, "summary": {"high_cardinality_features": [], "dominant_classes_features": []}}
 
@@ -327,11 +437,11 @@ class StatisticalAnalyzer(BaseAgent):
         for col in cat_cols:
             s = df[col].astype("string")
             s_nona = s.dropna()
-            if s_nona.empty:
+            if len(s_nona) < self.config.min_non_na_categorical:
                 continue
 
             vc = s_nona.value_counts()
-            mode_val = None
+            # Mode
             try:
                 m = s_nona.mode()
                 mode_val = str(m.iloc[0]) if not m.empty else None
@@ -344,7 +454,7 @@ class StatisticalAnalyzer(BaseAgent):
             is_binary = bool(n_unique == 2)
             if n_unique > self.config.high_cardinality_threshold:
                 cardinality = "high"; high_card_list.append(col)
-            elif n_unique > self.config.high_cardinality_threshold * 0.4:
+            elif n_unique > int(self.config.high_cardinality_threshold * 0.4):
                 cardinality = "medium"
             else:
                 cardinality = "low"
@@ -369,9 +479,9 @@ class StatisticalAnalyzer(BaseAgent):
         return {"n_features": len(cat_cols), "features": features_stats,
                 "summary": {"high_cardinality_features": high_card_list, "dominant_classes_features": dominant_list}}
 
-    # === NAZWA_SEKCJI === ROZKŁADY ===
+    # === NAZWA SEKCJI === ROZKŁADY ===
     def _maybe_sample_for_tests(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, bool, Optional[Dict[str, int]]]:
-        """Sampling safety dla bardzo dużych tabel przy testach normalności."""
+        """Sampling safety dla bardzo dużych tabel przy testach normalności (na num_df)."""
         if len(df) > self.config.max_rows_for_tests:
             self._log.info(f"Sampling for distribution tests: {len(df)} → {self.config.max_rows_for_tests}")
             return df.sample(n=self.config.max_rows_for_tests, random_state=self.config.random_state), True, \
@@ -380,14 +490,14 @@ class StatisticalAnalyzer(BaseAgent):
 
     def _analyze_distributions(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Analyze distributions of numeric features (normalność + heurystyka kształtu)."""
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        num_cols = df.columns.tolist()
         if len(num_cols) == 0:
             return {}
 
         out: Dict[str, Dict[str, Any]] = {}
         for col in num_cols:
             s = pd.to_numeric(df[col], errors="coerce").dropna()
-            if len(s) < 10:
+            if len(s) < max(10, self.config.min_non_na_numeric):
                 continue  # zbyt mało danych do testów
 
             # Test normalności: Shapiro (małe N), inaczej D’Agostino K²; fallback Anderson
@@ -449,7 +559,7 @@ class StatisticalAnalyzer(BaseAgent):
         outliers = ((series < (q1 - 1.5 * iqr)) | (series > (q3 + 1.5 * iqr))).sum()
         return bool(outliers > 0)
 
-    # === NAZWA_SEKCJI === REKOMENDACJE ===
+    # === NAZWA SEKCJI === REKOMENDACJE ===
     def _build_recommendations(
         self,
         numeric_stats: Dict[str, Any],
@@ -494,7 +604,7 @@ class StatisticalAnalyzer(BaseAgent):
 
         return list(dict.fromkeys(rec))  # dedup
 
-    # === NAZWA_SEKCJI === PAYLOAD DLA PUSTYCH DANYCH ===
+    # === NAZWA SEKCJI === PAYLOAD DLA PUSTYCH DANYCH ===
     @staticmethod
     def _empty_payload() -> Dict[str, Any]:
         return {
@@ -504,6 +614,12 @@ class StatisticalAnalyzer(BaseAgent):
             "distributions": {},
             "recommendations": ["Dostarcz dane, aby przeprowadzić analizę statystyczną."],
             "summary": {"n_zero_variance": 0, "n_near_constant": 0, "n_high_cv": 0, "n_high_cardinality": 0, "n_dominant_categorical": 0},
-            "telemetry": {"elapsed_ms": 0.0, "timings_ms": {"overall": 0.0, "numeric": 0.0, "categorical": 0.0, "distributions": 0.0},
-                          "sampled_for_tests": False, "sample_info": None}
+            "telemetry": {
+                "elapsed_ms": 0.0,
+                "timings_ms": {"overall": 0.0, "numeric": 0.0, "categorical": 0.0, "distributions": 0.0},
+                "sampled_for_tests": False, "sample_info": None,
+                "caps": {"numeric_cols_total": 0, "numeric_cols_used": 0, "numeric_cols_cap": 0,
+                         "categorical_cols_total": 0, "categorical_cols_used": 0, "categorical_cols_cap": 0},
+                "skipped_columns": {"numeric_empty": [], "categorical_empty": []}
+            }
         }

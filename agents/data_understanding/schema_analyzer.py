@@ -1,6 +1,6 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Schema Analyzer (PRO+++)
+DataGenius PRO - Schema Analyzer (PRO++++++++++)
 Analiza schematu i struktury danych: typy, semantyka, pamięć, statystyki oraz sugestie.
 
 Kontrakt (AgentResult.data):
@@ -54,6 +54,11 @@ class SchemaAnalyzerConfig:
     numeric_zero_count_limit: int = 10**9    # bezpieczny limit liczenia zer
     include_dataset_hash: bool = True        # do porównań/cachu
     truncate_log_chars: int = 500            # skracanie w logach
+    cast_object_numeric_ratio: float = 0.90  # ≥90% parsowalnych → cast do float64
+    cast_object_datetime_ratio: float = 0.90 # ≥90% parsowalnych → cast do datetime64[ns]
+    enable_composite_pk_search: bool = True  # heurystyka 2-kolumnowych PK
+    max_cols_for_composite_pk: int = 30      # limit kolumn dla PK-combo
+    max_rows_for_composite_pk: int = 100_000 # limit wierszy dla PK-combo
 
 # === NAZWA_SEKCJI === POMOCNICZE TYPY ===
 @dataclass
@@ -98,9 +103,10 @@ def _dataset_hash(df: pd.DataFrame, sample_rows: int = 100_000) -> str:
 def _safe_numeric(series: pd.Series) -> pd.Series:
     """Bezpieczne rzutowanie do float (z zachowaniem NaN)."""
     try:
-        return pd.to_numeric(series, errors="coerce")
+        s = pd.to_numeric(series.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        return s
     except Exception:
-        return series
+        return pd.to_numeric(series, errors="coerce")
 
 def _truncate(obj: Any, limit: int) -> str:
     try:
@@ -127,6 +133,46 @@ def _is_id_like(s: pd.Series, ratio_threshold: float) -> bool:
         return n > 0 and (n_unique / n) >= ratio_threshold
     except Exception:
         return False
+
+def _has_leading_trailing_spaces(s: pd.Series) -> bool:
+    """Czy w object występują wiodące/końcowe spacje w ≥1 elemencie."""
+    if s.dtype != "object":
+        return False
+    try:
+        ss = s.dropna().astype(str)
+        if ss.empty:
+            return False
+        mask = ss.ne(ss.str.strip())
+        return bool(mask.any())
+    except Exception:
+        return False
+
+def _is_non_normalized_categories(s: pd.Series) -> bool:
+    """Czy widać różne warianty tej samej kategorii (np. case/spacing)? Heurystycznie."""
+    if s.dtype != "object" and not pd.api.types.is_categorical_dtype(s):
+        return False
+    try:
+        ss = s.dropna().astype(str)
+        if ss.empty:
+            return False
+        norm = ss.str.strip().str.lower()
+        return int(norm.nunique()) < int(ss.nunique())  # zlewa warianty → były nienormalizowane
+    except Exception:
+        return False
+
+def _object_numeric_ratio(s: pd.Series) -> float:
+    try:
+        ss = pd.to_numeric(s.dropna().astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        return float(ss.notna().mean()) if len(ss) else 0.0
+    except Exception:
+        return 0.0
+
+def _object_datetime_ratio(s: pd.Series) -> float:
+    try:
+        ss = pd.to_datetime(s.dropna().astype(str), errors="coerce", utc=False)
+        return float(ss.notna().mean()) if len(ss) else 0.0
+    except Exception:
+        return 0.0
 
 # === NAZWA_SEKCJI === KLASA GŁÓWNA AGENDA ===
 class SchemaAnalyzer(BaseAgent):
@@ -280,6 +326,12 @@ class SchemaAnalyzer(BaseAgent):
                     ss = s.dropna().astype(str)
                     if not ss.empty and float(ss.str.len().mean()) >= cfg.text_heavy_avg_len:
                         extras["text_heavy"] = True
+                    # leading/trailing spaces
+                    if _has_leading_trailing_spaces(s):
+                        extras["has_leading_trailing_spaces"] = True
+                    # non-normalized categories
+                    if _is_non_normalized_categories(s):
+                        extras["non_normalized_categories"] = True
                 except Exception:
                     pass
 
@@ -351,7 +403,7 @@ class SchemaAnalyzer(BaseAgent):
 
         return {
             "mode": mode_val,
-            "top_values": {str(k): int(v) for k, v in vc.head(5).to_dict().items()},
+            "top_values": {str(k): int(v) for k, v in vc.head(5).to_dict().items() },
             "n_categories": int(vc.shape[0]),
             "is_binary": bool(vc.shape[0] == 2),
             "high_cardinality": bool(vc.shape[0] > 0.90 * max(1, len(s))),
@@ -367,10 +419,13 @@ class SchemaAnalyzer(BaseAgent):
 
         min_d = s.min()
         max_d = s.max()
+        # Wykrywanie potencjalnie mieszanych stref czasowych (heurystyka: obecność tz-aware + tz-naive)
+        tz_mixed = bool(getattr(series.dtype, "tz", None)) and any(getattr(x, "tzinfo", None) is None for x in series.dropna().tolist())
         return {
             "min_date": str(min_d),
             "max_date": str(max_d),
             "date_range_days": int((max_d - min_d).days),
+            "maybe_mixed_timezones": tz_mixed,
         }
 
     # === NAZWA_SEKCJI === PODSUMOWANIE DTYPES ===
@@ -404,9 +459,9 @@ class SchemaAnalyzer(BaseAgent):
         cfg = self.config
         suggestions: Dict[str, Any] = {
             "potential_primary_keys": [],
-            "potential_casts": [],    # {"column": "...", "from": "object", "to": "float64"}
-            "downcast_hints": [],     # {"column": "...", "from": "int64", "to": "int32", "est_saving_mb": ...}
-            "encoder_recommendations": [],  # {"column": "...", "encoder": "OneHot/Ordinal/Target/LeaveOneOut", "reason": "..."}
+            "potential_casts": [],    # {"column": "...", "from": "object", "to": "float64" / "datetime64[ns]"}
+            "downcast_hints": [],     # {"column": "...", "from": "int64", "to": "int32"/"uint32" / "float32", "est_saving_mb": ...}
+            "encoder_recommendations": [],  # {"column": "...", "encoder": "OneHot/Ordinal/Target/LeaveOneOut/DateParts", "reason": "..."}
             "warnings": [],
         }
 
@@ -414,58 +469,90 @@ class SchemaAnalyzer(BaseAgent):
         cat_cols = get_categorical_columns(df)
         num_cols = get_numeric_columns(df)
 
-        # Potencjalne PK
+        # Potencjalne PK (pojedyncze)
         for c in columns:
             unique_ratio = (c.get("n_unique", 0) / n)
             if (unique_ratio >= cfg.potential_pk_unique_ratio) and (c.get("n_missing", 0) <= cfg.potential_pk_max_nulls):
                 suggestions["potential_primary_keys"].append(c["name"])
 
-        # Potencjalne casty: object → numeric / datetime
+        # Potencjalne PK złożone (2-kolumnowe), tylko dla umiarkowanych rozmiarów
+        if cfg.enable_composite_pk_search and len(df.columns) <= cfg.max_cols_for_composite_pk and len(df) <= cfg.max_rows_for_composite_pk:
+            try:
+                cols = [c["name"] for c in columns if c["name"] not in suggestions["potential_primary_keys"]]
+                # wybierz tylko kolumny o n_missing==0
+                cols = [c for c in cols if int(df[c].isna().sum()) == 0]
+                # heurystyka: sprawdzaj pary tylko z sensowną kardynalnością (pomijaj stałe)
+                candidate_pairs: List[Tuple[str, str]] = []
+                nunique_map = {c: int(df[c].nunique(dropna=True)) for c in cols}
+                cols_sorted = sorted(cols, key=lambda x: nunique_map[x], reverse=True)[:20]  # miękki limit
+                for i in range(min(20, len(cols_sorted))):
+                    for j in range(i + 1, min(20, len(cols_sorted))):
+                        a, b = cols_sorted[i], cols_sorted[j]
+                        if nunique_map[a] <= 1 or nunique_map[b] <= 1:
+                            continue
+                        combo_unique = int(df[[a, b]].drop_duplicates().shape[0])
+                        if combo_unique >= int(cfg.potential_pk_unique_ratio * n):
+                            suggestions["potential_primary_keys"].append(f"{a} + {b}")
+                # deduplikacja
+                suggestions["potential_primary_keys"] = list(dict.fromkeys(suggestions["potential_primary_keys"]))
+            except Exception:
+                pass
+
+        # Potencjalne casty: object → numeric / datetime (progi 90%)
         for col in cat_cols:
             s = df[col]
             try:
-                num_coerced = pd.to_numeric(s, errors="coerce")
-                if num_coerced.notna().sum() > 0 and (num_coerced.notna().sum() / n) > 0.9:
+                num_ratio = _object_numeric_ratio(s)
+                if num_ratio >= cfg.cast_object_numeric_ratio:
                     suggestions["potential_casts"].append({"column": col, "from": str(s.dtype), "to": "float64"})
                     continue
-                dt_coerced = pd.to_datetime(s, errors="coerce", utc=False)
-                if dt_coerced.notna().sum() > 0 and (dt_coerced.notna().sum() / n) > 0.9:
+                dt_ratio = _object_datetime_ratio(s)
+                if dt_ratio >= cfg.cast_object_datetime_ratio:
                     suggestions["potential_casts"].append({"column": col, "from": str(s.dtype), "to": "datetime64[ns]"})
             except Exception:
                 pass
 
-        # Warnings: high missing / high cardinality
+        # Warnings: high missing / high cardinality / mixed / spaces / non-normalized
         for c in columns:
+            name = c["name"]
+            extras = c.get("extras", {})
             if c.get("missing_pct", 0.0) > (cfg.high_missing_ratio_flag * 100):
                 suggestions["warnings"].append(
-                    f"Column '{c['name']}' has high missing ratio ({c['missing_pct']:.1f}%)."
+                    f"Column '{name}' has high missing ratio ({c['missing_pct']:.1f}%)."
                 )
-            if c.get("extras", {}).get("high_cardinality", False):
+            if extras.get("high_cardinality", False):
                 suggestions["warnings"].append(
-                    f"Column '{c['name']}' has high cardinality."
+                    f"Column '{name}' has high cardinality."
                 )
-            if c.get("extras", {}).get("mixed_type", False):
+            if extras.get("mixed_type", False):
                 suggestions["warnings"].append(
-                    f"Column '{c['name']}' may contain mixed types (numeric/text)."
+                    f"Column '{name}' may contain mixed types (numeric/text)."
+                )
+            if extras.get("has_leading_trailing_spaces", False):
+                suggestions["warnings"].append(
+                    f"Column '{name}' may contain leading/trailing spaces."
+                )
+            if extras.get("non_normalized_categories", False):
+                suggestions["warnings"].append(
+                    f"Column '{name}' may contain non-normalized categories (case/spacing variants)."
                 )
 
         # Downcast hints (num_cols)
-        mem_before = df.memory_usage(deep=True).sum() if len(df) else 0
         for col in num_cols:
             s = df[col]
             from_dtype = str(s.dtype)
             to_dtype: Optional[str] = None
             try:
                 if pd.api.types.is_float_dtype(s):
-                    # jeżeli wartości mieszczą się w float32 z sensowną precyzją
                     s32 = s.astype(np.float32)
-                    if np.isfinite(s).all() and np.isfinite(s32).all():
+                    if np.isfinite(s32.fillna(0)).all():
                         to_dtype = "float32"
                 elif pd.api.types.is_integer_dtype(s):
-                    # spróbuj int32
-                    s32 = s.astype(np.int32, copy=False)
-                    if s32.dtype.kind in ("i", "u"):
-                        # sprawdź zakres
+                    if s.min() >= 0:
+                        # spróbuj uint32
+                        if s.max() <= np.iinfo(np.uint32).max:
+                            to_dtype = "uint32"
+                    else:
                         if s.min() >= np.iinfo(np.int32).min and s.max() <= np.iinfo(np.int32).max:
                             to_dtype = "int32"
             except Exception:
@@ -482,11 +569,18 @@ class SchemaAnalyzer(BaseAgent):
                         "column": col, "from": from_dtype, "to": to_dtype, "est_saving_mb": None
                     })
 
-        # Encoder recommendations
+        # Encoder recommendations (w tym datetime)
         for c in columns:
             name = c["name"]
             extras = c.get("extras", {})
             dtype = c.get("dtype", "")
+            if pd.api.types.is_datetime64_any_dtype(df[name]):
+                # rekomendacja rozbicia na cechy czasowe
+                suggestions["encoder_recommendations"].append({
+                    "column": name, "encoder": "DateParts", "reason": "datetime features (Y/M/D/DOW/H)"
+                })
+                continue
+
             if dtype in ("object", "category"):
                 if extras.get("high_cardinality"):
                     suggestions["encoder_recommendations"].append({

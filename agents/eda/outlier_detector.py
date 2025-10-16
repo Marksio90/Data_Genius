@@ -1,8 +1,19 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Outlier Detector (PRO++++)
-Wykrywa outliery metodami IQR, Z-score, Robust Z-score (Median+MAD) oraz Isolation Forest (opcjonalnie),
-z defensywnymi guardami, telemetry i spójnym kontraktem danych.
+DataGenius PRO++++++ - Outlier Detector (Enterprise)
+Wykrywa outliery metodami:
+- IQR
+- Z-score (klasyczny)
+- Robust Z-score (Median + MAD)
+- Isolation Forest (opcjonalnie, z robust-scalingiem i samplingiem)
+
+Cechy ENTERPRISE:
+- twarde i miękkie guardy wydajnościowe (caps na wiersze/kolumny, stałe kolumny, binarne)
+- odporność na NaN/Inf, defensywne rzutowania, minimalne wymagania dot. liczności
+- telemetry (timingi, sampling, wykorzystane/ominięte kolumny, liczniki)
+- stabilny kontrakt danych + rozszerzenia (compat z PRO++++)
+- konfigurowalne strategie (skip binarnych/stałych, min non-NA, cap kolumn)
+- spójne logowanie (loguru), brak side-effectów na oryginalnym DF
 
 Kontrakt (AgentResult.data):
 {
@@ -12,7 +23,8 @@ Kontrakt (AgentResult.data):
       "params": {"iqr_factor": float},
       "columns": {col: {"n_outliers": int, "percentage": float, "lower_bound": float, "upper_bound": float,
                         "outlier_indices": List[Any]}},
-      "n_columns_with_outliers": int
+      "n_columns_with_outliers": int,
+      "guards": {"skipped_constant": List[str], "skipped_low_n": List[str]}
   },
   "zscore_method": {
       "method": "Z-Score",
@@ -20,7 +32,8 @@ Kontrakt (AgentResult.data):
       "params": {"threshold": float},
       "columns": {col: {"n_outliers": int, "percentage": float, "threshold": float,
                         "outlier_indices": List[Any]}},
-      "n_columns_with_outliers": int
+      "n_columns_with_outliers": int,
+      "guards": {"skipped_constant": List[str], "skipped_low_n": List[str]}
   },
   "robust_zscore_method": {
       "method": "Robust Z-Score (Median+MAD)",
@@ -28,7 +41,8 @@ Kontrakt (AgentResult.data):
       "params": {"threshold": float},
       "columns": {col: {"n_outliers": int, "percentage": float, "threshold": float,
                         "median": float, "mad": float, "outlier_indices": List[Any]}},
-      "n_columns_with_outliers": int
+      "n_columns_with_outliers": int,
+      "guards": {"skipped_zero_mad": List[str], "skipped_low_n": List[str]}
   },
   "isolation_forest": {
       "method": "Isolation Forest",
@@ -54,7 +68,9 @@ Kontrakt (AgentResult.data):
       "elapsed_ms": float,
       "timings_ms": {"iqr": float, "zscore": float, "robust_z": float, "iforest": float},
       "sampled_iforest": bool,
-      "iforest_sample_info": {"from_rows": int, "to_rows": int} | None
+      "iforest_sample_info": {"from_rows": int, "to_rows": int} | None,
+      "caps": {"numeric_cols_total": int, "numeric_cols_used": int, "numeric_cols_cap": int},
+      "skipped_columns": {"non_numeric": List[str], "binary_like": List[str], "constant": List[str], "excluded": List[str]}
   }
 }
 """
@@ -68,7 +84,6 @@ from typing import Dict, Any, List, Optional, Tuple, Set
 import numpy as np
 import pandas as pd
 from loguru import logger
-from scipy import stats
 from sklearn.ensemble import IsolationForest
 
 from core.base_agent import BaseAgent, AgentResult
@@ -91,19 +106,23 @@ class OutlierConfig:
     if_n_jobs: int = -1
     if_contam_min: float = 0.01
     if_contam_max: float = 0.20
-    if_max_rows: int = 500_000            # sampling safety dla IF
-    if_max_features: int = 500            # cap liczby kolumn do IF (wysokowymiarowe macierze)
+    if_max_rows: int = 500_000           # sampling safety dla IF
+    if_max_features: int = 500           # cap liczby kolumn do IF (wysokowymiarowe macierze)
     # — wynik/telemetria —
-    max_indices_return: int = 25           # ile przykładowych indeksów zwracać
-    # — bezpieczeństwo —
-    clip_inf_to_nan: bool = True           # zamiana inf/-inf → NaN (potem median-impute do IF)
+    max_indices_return: int = 25         # ile przykładowych indeksów zwracać
+    # — bezpieczeństwo / guardy —
+    clip_inf_to_nan: bool = True         # zamiana inf/-inf → NaN (potem median-impute do IF)
+    min_non_na_per_col: int = 5          # minimalna liczba nie-NaN do wykonywania metody kolumnowej
+    skip_binary_like: bool = True        # pomijaj kolumny ~binarnie (<=2 unikatowe wartości nie-NaN)
+    max_numeric_cols: int = 3000         # miękki limit liczby kolumn numerycznych do analizy
+    exclude_columns: Tuple[str, ...] = ()# kolumny do wykluczenia (po nazwie)
 
 
 # === NAZWA_SEKCJI === KLASA GŁÓWNA AGENDA ===
 class OutlierDetector(BaseAgent):
     """
     Detects outliers using IQR, Z-score, Robust Z-score and Isolation Forest (opcjonalnie).
-    Defensywna, szybka i skalowalna implementacja PRO++++.
+    Defensywna, szybka i skalowalna implementacja PRO++++++.
     """
 
     def __init__(self, config: Optional[OutlierConfig] = None) -> None:
@@ -112,9 +131,17 @@ class OutlierDetector(BaseAgent):
         self._log = logger.bind(agent="OutlierDetector")
 
     # === NAZWA_SEKCJI === WYKONANIE GŁÓWNE ===
-    def execute(self, data: pd.DataFrame, **kwargs: Any) -> AgentResult:
+    def execute(
+        self,
+        data: pd.DataFrame,
+        **kwargs: Any
+    ) -> AgentResult:
         """
         Detect outliers across numeric features using multiple robust methods.
+
+        Optional kwargs (nie psują kontraktu):
+            include_columns: Optional[List[str]]  — biały filtr kolumn (zostaną przecięte z numerycznymi)
+            override_if_contamination: Optional[float] — wymuszenie kontaminacji IF (clamp do [min,max])
         """
         result = AgentResult(agent_name=self.name)
         t0_total = time.perf_counter()
@@ -127,15 +154,28 @@ class OutlierDetector(BaseAgent):
                 self._log.error(msg)
                 return result
 
-            # Numeric-only (Inf→NaN opcjonalnie)
-            df_num = data.select_dtypes(include=[np.number]).copy()
-            if df_num.shape[1] == 0:
-                result.add_warning("No numeric columns for outlier detection")
+            cfg = self.config
+
+            # Wybór kolumn numerycznych z guardami
+            include_columns = kwargs.get("include_columns")
+            num_df, caps_meta = self._select_numeric_subset(
+                data,
+                include_columns=include_columns,
+                exclude_columns=cfg.exclude_columns,
+                max_cols=cfg.max_numeric_cols,
+                skip_binary_like=cfg.skip_binary_like
+            )
+
+            if num_df.shape[1] == 0:
+                result.add_warning("No suitable numeric columns for outlier detection (after guards).")
                 result.data = self._empty_payload_no_numeric()
                 result.data["telemetry"]["elapsed_ms"] = round((time.perf_counter() - t0_total) * 1000, 1)
+                result.data["telemetry"]["caps"] = caps_meta.get("caps", {})
+                result.data["telemetry"]["skipped_columns"] = caps_meta.get("skipped", {})
                 return result
 
-            if self.config.clip_inf_to_nan:
+            df_num = num_df.copy()
+            if cfg.clip_inf_to_nan:
                 df_num = df_num.replace([np.inf, -np.inf], np.nan)
 
             # === 1) IQR ===
@@ -145,19 +185,27 @@ class OutlierDetector(BaseAgent):
 
             # === 2) Z-score ===
             t0 = time.perf_counter()
-            z_dict, mask_z = self._detect_zscore_outliers(df_num, threshold=self.config.zscore_threshold)
+            z_dict, mask_z = self._detect_zscore_outliers(df_num, threshold=cfg.zscore_threshold)
             t_z = (time.perf_counter() - t0) * 1000
 
             # === 3) Robust Z-score (Median+MAD) ===
             t0 = time.perf_counter()
-            rz_dict, mask_rz = self._detect_robust_zscore_outliers(df_num, threshold=self.config.robust_z_threshold)
+            rz_dict, mask_rz = self._detect_robust_zscore_outliers(df_num, threshold=cfg.robust_z_threshold)
             t_rz = (time.perf_counter() - t0) * 1000
 
             # === 4) Isolation Forest (opcjonalnie, z samplingiem/robust-scaling) ===
             t0 = time.perf_counter()
             if_dict, mask_if, sampled_if, sample_info_if = None, None, False, None
-            if self.config.enable_isolation_forest and len(df_num) >= self.config.min_rows_for_if:
+            if cfg.enable_isolation_forest and len(df_num) >= cfg.min_rows_for_if:
+                # estymacja kontaminacji lub override
                 est_contam = self._estimate_contamination_from_iqr(iqr_dict, n_rows=len(df_num))
+                override_if_contamination = kwargs.get("override_if_contamination", None)
+                if override_if_contamination is not None:
+                    try:
+                        ov = float(override_if_contamination)
+                        est_contam = float(np.clip(ov, cfg.if_contam_min, cfg.if_contam_max))
+                    except Exception:
+                        pass
                 if_dict, mask_if, sampled_if, sample_info_if = self._detect_isolation_forest_outliers(
                     df_num, contamination=est_contam
                 )
@@ -184,10 +232,15 @@ class OutlierDetector(BaseAgent):
                         "robust_z": round(t_rz, 1), "iforest": round(t_if, 1)
                     },
                     "sampled_iforest": bool(sampled_if),
-                    "iforest_sample_info": sample_info_if
+                    "iforest_sample_info": sample_info_if,
+                    "caps": caps_meta.get("caps", {}),
+                    "skipped_columns": caps_meta.get("skipped", {}),
                 }
             }
-            self._log.success(f"Outlier detection complete: {summary['total_outliers_rows_union']} rows flagged (union)")
+            self._log.success(
+                f"Outlier detection complete: {summary['total_outliers_rows_union']} rows flagged (union), "
+                f"used {caps_meta.get('caps',{}).get('numeric_cols_used', df_num.shape[1])} numeric cols."
+            )
 
         except Exception as e:
             result.add_error(f"Outlier detection failed: {e}")
@@ -195,22 +248,89 @@ class OutlierDetector(BaseAgent):
 
         return result
 
+    # === NAZWA SEKCJI === WYBÓR PODZBIORU KOLUMN NUMERYCZNYCH (z guardami) ===
+    def _select_numeric_subset(
+        self,
+        df: pd.DataFrame,
+        include_columns: Optional[List[str]],
+        exclude_columns: Tuple[str, ...],
+        max_cols: int,
+        skip_binary_like: bool
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Zwraca (df_numeric_filtered, meta_caps_and_skipped)."""
+        all_numeric = df.select_dtypes(include=[np.number]).copy()
+        total_num = all_numeric.shape[1]
+
+        # Wykluczenia po nazwie
+        skipped_excluded: List[str] = []
+        if exclude_columns:
+            present_excl = [c for c in exclude_columns if c in all_numeric.columns]
+            skipped_excluded.extend(present_excl)
+            all_numeric = all_numeric.drop(columns=present_excl, errors="ignore")
+
+        # Include-list (opcjonalny biały filtr)
+        if include_columns:
+            keep = [c for c in include_columns if c in all_numeric.columns]
+            all_numeric = all_numeric.loc[:, keep]
+
+        # Binary-like (<=2 unique nie-NaN)
+        skipped_binary: List[str] = []
+        if skip_binary_like and all_numeric.shape[1] > 0:
+            nun = all_numeric.nunique(dropna=True)
+            binary_cols = nun[(nun <= 2)].index.tolist()
+            if binary_cols:
+                skipped_binary = binary_cols
+                all_numeric = all_numeric.drop(columns=binary_cols, errors="ignore")
+
+        # Stałe kolumny (po NA-coerce)
+        skipped_constant: List[str] = []
+        if all_numeric.shape[1] > 0:
+            nun2 = all_numeric.apply(lambda s: pd.to_numeric(s, errors="coerce")).nunique(dropna=True)
+            const_cols = nun2[(nun2 <= 1)].index.tolist()
+            if const_cols:
+                skipped_constant = const_cols
+                all_numeric = all_numeric.drop(columns=const_cols, errors="ignore")
+
+        # Cap szerokości
+        used_cols = all_numeric.columns[:max_cols]
+        capped = all_numeric.shape[1] > max_cols
+        all_numeric = all_numeric.loc[:, used_cols]
+
+        caps_meta = {
+            "caps": {
+                "numeric_cols_total": int(total_num),
+                "numeric_cols_used": int(all_numeric.shape[1]),
+                "numeric_cols_cap": int(max_cols) if capped else int(all_numeric.shape[1]),
+            },
+            "skipped": {
+                "non_numeric": [],
+                "binary_like": skipped_binary,
+                "constant": skipped_constant,
+                "excluded": skipped_excluded
+            }
+        }
+        return all_numeric, caps_meta
+
     # === NAZWA_SEKCJI === IQR ===
     def _detect_iqr_outliers(self, df: pd.DataFrame) -> Tuple[Dict[str, Any], pd.Series]:
-        """Detect outliers using IQR method (z guardem IQR=0). Zwraca (payload, row_mask_union)."""
+        """Detect outliers using IQR method (z guardem IQR=0, min_non_na). Zwraca (payload, row_mask_union)."""
         cfg = self.config
         outliers_by_column: Dict[str, Dict[str, Any]] = {}
         row_mask = pd.Series(False, index=df.index)
+        skipped_constant: List[str] = []
+        skipped_low_n: List[str] = []
 
         for col in df.columns:
             s = pd.to_numeric(df[col], errors="coerce")
             s_nona = s.dropna()
-            if s_nona.empty:
+            if len(s_nona) < cfg.min_non_na_per_col:
+                skipped_low_n.append(str(col))
                 continue
 
             q1, q3 = s_nona.quantile(0.25), s_nona.quantile(0.75)
             iqr = q3 - q1
             if iqr <= 0:
+                skipped_constant.append(str(col))
                 continue
 
             lower = q1 - cfg.iqr_factor * iqr
@@ -234,23 +354,29 @@ class OutlierDetector(BaseAgent):
             "params": {"iqr_factor": float(cfg.iqr_factor)},
             "columns": outliers_by_column,
             "n_columns_with_outliers": len(outliers_by_column),
+            "guards": {"skipped_constant": skipped_constant, "skipped_low_n": skipped_low_n}
         }
         return payload, row_mask
 
     # === NAZWA_SEKCJI === Z-SCORE ===
     def _detect_zscore_outliers(self, df: pd.DataFrame, threshold: float) -> Tuple[Dict[str, Any], pd.Series]:
-        """Detect outliers using classic Z-score (guard std=0, NA-safe). Zwraca (payload, row_mask_union)."""
+        """Detect outliers using classic Z-score (guard std=0, min_non_na, NA-safe). Zwraca (payload, row_mask_union)."""
+        cfg = self.config
         outliers_by_column: Dict[str, Dict[str, Any]] = {}
         row_mask = pd.Series(False, index=df.index)
+        skipped_constant: List[str] = []
+        skipped_low_n: List[str] = []
 
         for col in df.columns:
             s = pd.to_numeric(df[col], errors="coerce")
             s_nona = s.dropna()
-            if s_nona.empty:
+            if len(s_nona) < cfg.min_non_na_per_col:
+                skipped_low_n.append(str(col))
                 continue
 
             std = float(s_nona.std(ddof=1)) if len(s_nona) > 1 else 0.0
             if std == 0.0:
+                skipped_constant.append(str(col))
                 continue
 
             z = np.abs((s - s_nona.mean()) / std)  # NaN-safe dzięki s
@@ -262,7 +388,7 @@ class OutlierDetector(BaseAgent):
                     "n_outliers": n_out,
                     "percentage": float(n_out / len(s) * 100.0),
                     "threshold": float(threshold),
-                    "outlier_indices": self._head_indices(mask[mask].index, self.config.max_indices_return),
+                    "outlier_indices": self._head_indices(mask[mask].index, cfg.max_indices_return),
                 }
 
         payload = {
@@ -271,6 +397,7 @@ class OutlierDetector(BaseAgent):
             "params": {"threshold": float(threshold)},
             "columns": outliers_by_column,
             "n_columns_with_outliers": len(outliers_by_column),
+            "guards": {"skipped_constant": skipped_constant, "skipped_low_n": skipped_low_n}
         }
         return payload, row_mask
 
@@ -280,19 +407,24 @@ class OutlierDetector(BaseAgent):
         Robust Z-score: z = 0.6745 * (x - median) / MAD; flagujemy |z| > threshold.
         Odporny na outliery i ciężkie ogony. Zwraca (payload, row_mask_union).
         """
+        cfg = self.config
         outliers_by_column: Dict[str, Dict[str, Any]] = {}
         row_mask = pd.Series(False, index=df.index)
         c = 0.6745
+        skipped_zero_mad: List[str] = []
+        skipped_low_n: List[str] = []
 
         for col in df.columns:
             s = pd.to_numeric(df[col], errors="coerce")
             s_nona = s.dropna()
-            if s_nona.empty:
+            if len(s_nona) < cfg.min_non_na_per_col:
+                skipped_low_n.append(str(col))
                 continue
 
             med = float(np.median(s_nona))
             mad = float(np.median(np.abs(s_nona - med)))
             if mad == 0.0:
+                skipped_zero_mad.append(str(col))
                 continue  # brak rozrzutu robust — pomijamy
 
             rz = np.abs(c * (s - med) / mad)
@@ -306,7 +438,7 @@ class OutlierDetector(BaseAgent):
                     "threshold": float(threshold),
                     "median": med,
                     "mad": mad,
-                    "outlier_indices": self._head_indices(mask[mask].index, self.config.max_indices_return),
+                    "outlier_indices": self._head_indices(mask[mask].index, cfg.max_indices_return),
                 }
 
         payload = {
@@ -315,6 +447,7 @@ class OutlierDetector(BaseAgent):
             "params": {"threshold": float(threshold)},
             "columns": outliers_by_column,
             "n_columns_with_outliers": len(outliers_by_column),
+            "guards": {"skipped_zero_mad": skipped_zero_mad, "skipped_low_n": skipped_low_n}
         }
         return payload, row_mask
 
@@ -488,7 +621,7 @@ class OutlierDetector(BaseAgent):
         if iqr_outliers.get("columns"):
             top = self._get_most_outliers_column(iqr_outliers)
             if top:
-                rec.append(f"📦 Najwięcej outlierów w '{top['column']}' — rozważ winsoryzację (IQR) lub transformację (log/yeo-johnson).")
+                rec.append(f"📦 Najwięcej outlierów w '{top['column']}' — rozważ winsoryzację (IQR) lub transformację (log/Yeo-Johnson).")
 
         # Z-score → standaryzacja
         if zscore_outliers.get("n_columns_with_outliers", 0) > 0:
@@ -510,19 +643,21 @@ class OutlierDetector(BaseAgent):
     def _empty_payload_no_numeric(self) -> Dict[str, Any]:
         return {
             "iqr_method": {"method": "IQR", "description": "No numeric columns", "params": {"iqr_factor": self.config.iqr_factor},
-                           "columns": {}, "n_columns_with_outliers": 0},
+                           "columns": {}, "n_columns_with_outliers": 0, "guards": {"skipped_constant": [], "skipped_low_n": []}},
             "zscore_method": {"method": "Z-Score", "description": "No numeric columns", "params": {"threshold": self.config.zscore_threshold},
-                              "columns": {}, "n_columns_with_outliers": 0},
+                              "columns": {}, "n_columns_with_outliers": 0, "guards": {"skipped_constant": [], "skipped_low_n": []}},
             "robust_zscore_method": {"method": "Robust Z-Score (Median+MAD)", "description": "No numeric columns",
                                      "params": {"threshold": self.config.robust_z_threshold},
-                                     "columns": {}, "n_columns_with_outliers": 0},
+                                     "columns": {}, "n_columns_with_outliers": 0, "guards": {"skipped_zero_mad": [], "skipped_low_n": []}},
             "isolation_forest": None,
             "summary": {"total_outliers_rows_union": 0, "by_method": {"IQR": 0, "Z-Score": 0, "RobustZ": 0, "Isolation Forest": 0},
                         "n_columns_with_outliers": 0, "methods_used": ["IQR","Z-Score","RobustZ"], "most_outliers": None,
                         "example_outlier_indices": []},
             "recommendations": ["Brak kolumn numerycznych — etap wykrywania outlierów pominięty."],
             "telemetry": {"elapsed_ms": 0.0, "timings_ms": {"iqr": 0.0, "zscore": 0.0, "robust_z": 0.0, "iforest": 0.0},
-                          "sampled_iforest": False, "iforest_sample_info": None}
+                          "sampled_iforest": False, "iforest_sample_info": None,
+                          "caps": {"numeric_cols_total": 0, "numeric_cols_used": 0, "numeric_cols_cap": 0},
+                          "skipped_columns": {"non_numeric": [], "binary_like": [], "constant": [], "excluded": []}}
         }
 
     # === NAZWA_SEKCJI === POMOCNICZE ===

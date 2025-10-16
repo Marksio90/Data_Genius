@@ -1,10 +1,11 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Problem Classifier (PRO++++)
+DataGenius PRO++++++++++ - Problem Classifier (Enterprise / KOSMOS)
 Klasyfikacja typu problemu ML (classification vs regression) na podstawie kolumny celu.
-Zwraca analizę targetu i rekomendacje metryk, preprocessing'u i modeli.
+Wersja ENTERPRISE PRO++++++ ADV: defensywne guardy, heurystyki korekcyjne,
+stabilny kontrakt danych, zwięzłe rekomendacje metryk, preprocessing'u i modeli.
 
-Kontrakt (AgentResult.data):
+⚠️ Kontrakt (AgentResult.data) — ściśle 1:1:
 {
     "problem_type": "classification" | "regression" | None,
     "target_analysis": Dict[str, Any],
@@ -18,13 +19,13 @@ Kontrakt (AgentResult.data):
 }
 """
 
-# === IMPORTY ===
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, List, Tuple, Callable
+# === IMPORTY ===
 import time
 import json
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,31 +35,26 @@ from core.base_agent import BaseAgent, AgentResult
 from core.utils import infer_problem_type
 from config.model_registry import ProblemType
 
-# === NAZWA_SEKCJI === MODELE DANYCH / KONFIG ===
+
+# === NAZWA_SEKCJI === KONFIG / PROGI ===
 @dataclass(frozen=True)
 class ProblemClassifierConfig:
-    """Parametry i progi heurystyczne dla analizy targetu."""
-    imbalance_ratio_threshold: float = 3.0    # >3 uznajemy za istotną nierównowagę klas
-    warn_min_samples_per_class: int = 20      # ostrzeżenie dla rzadkich klas
-    skew_warn_abs: float = 1.0                # |skew| > 1 ⇒ rozważ transformację
-    min_samples_required: int = 1             # minimalna liczba obserwacji po dropna()
-    id_like_unique_ratio: float = 0.98        # ~98%+ unikalnych sugeruje ID/sygn. ciągłą
-    treat_numeric_str_as_numeric: bool = True # "123" → 123 przy regresji
-    truncate_log_chars: int = 400             # cięcie długich struktur w logach
+    """Parametry i progi heurystyczne dla analizy targetu (enterprise)."""
+    imbalance_ratio_threshold: float = 3.0       # >3 uznajemy za istotną nierównowagę klas
+    warn_min_samples_per_class: int = 20         # ostrzeżenie dla rzadkich klas
+    rare_class_threshold: int = 5                # bardzo rzadkie klasy
+    skew_warn_abs: float = 1.0                   # |skew| > 1 ⇒ transformacje sugerowane
+    min_samples_required: int = 1                # minimalna liczba obserwacji po dropna()
+    id_like_unique_ratio: float = 0.98           # ~98%+ unikalnych sugeruje ID/sygn. ciągłą
+    treat_numeric_str_as_numeric: bool = True    # "123" → 123 przy regresji
+    truncate_log_chars: int = 400                # cięcie długich struktur w logach
+    small_unique_threshold: int = 15             # <=15 unikalnych (num.) → prefer classification
+    allow_none_problem_fallback: bool = False    # jeśli True, zwraca None gdy niepewne (zamiast fallbacku)
+    # wskazówki dla binarnych (nie wpływa na kontrakt — tylko wewn. heurystyki)
+    binary_positive_hint_keywords: Tuple[str, ...] = ("yes", "true", "1", "success", "positive")
+
 
 # === NAZWA_SEKCJI === HELPERY ===
-def _timeit(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
-            t0 = time.perf_counter()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                dt = (time.perf_counter() - t0) * 1000
-                logger.debug(f"{name}: {dt:.1f} ms")
-        return wrapped
-    return deco
-
 def _truncate(obj: Any, limit: int) -> str:
     try:
         s = json.dumps(obj, ensure_ascii=False, default=str)
@@ -66,14 +62,20 @@ def _truncate(obj: Any, limit: int) -> str:
         s = str(obj)
     return s if len(s) <= limit else s[:limit] + f"...(+{len(s)-limit} chars)"
 
+
 def _is_numeric_series_like(s: pd.Series) -> bool:
     """Heurystyka: czy seria może być traktowana jako numeryczna po konwersji."""
     if pd.api.types.is_numeric_dtype(s):
         return True
     if s.dtype == "object":
-        ss = pd.to_numeric(s.dropna().astype(str), errors="coerce")
-        return not ss.dropna().empty and (ss.dropna().shape[0] / max(1, s.dropna().shape[0])) > 0.9
+        try:
+            ss = pd.to_numeric(s.dropna().astype(str).str.replace(",", ".", regex=False), errors="coerce")
+            ratio = float(ss.notna().mean()) if len(ss) else 0.0
+            return ratio > 0.9
+        except Exception:
+            return False
     return False
+
 
 def _is_id_like(s: pd.Series, ratio_threshold: float) -> bool:
     """Czy kolumna wygląda na ID (prawie same unikalne wartości)."""
@@ -84,11 +86,34 @@ def _is_id_like(s: pd.Series, ratio_threshold: float) -> bool:
     except Exception:
         return False
 
-# === NAZWA_SEKCJI === KLASA GŁÓWNA AGENDA ===
+
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    """Bezpieczna próba rzutowania do float (z kropką zamiast przecinka)."""
+    if pd.api.types.is_numeric_dtype(s):
+        return s.astype(float)
+    try:
+        ss = pd.to_numeric(s.astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        return ss
+    except Exception:
+        return s
+
+
+def _majority_label(vc: pd.Series) -> Tuple[Optional[str], float]:
+    """Zwraca (etykieta_max, procent_max) dla value_counts bez NaN."""
+    if vc.empty:
+        return None, 0.0
+    total = int(vc.sum())
+    lab = str(vc.index[0])
+    pct = float(vc.iloc[0] / max(1, total) * 100.0)
+    return lab, pct
+
+
+# === NAZWA_SEKCJI === KLASA GŁÓWNA ===
 class ProblemClassifier(BaseAgent):
     """
     Klasyfikuje typ problemu ML na podstawie targetu (classification vs regression),
-    wykonuje analizę kolumny celu i zwraca rekomendacje metryk, preprocessing'u i modeli.
+    wykonuje analizę kolumny celu i zwraca rekomendacje metryk, preprocessing'u oraz modeli.
+    Kontrakt 1:1 zgodny z orkiestratorem.
     """
 
     def __init__(self, config: Optional[ProblemClassifierConfig] = None) -> None:
@@ -99,7 +124,7 @@ class ProblemClassifier(BaseAgent):
         self.config = config or ProblemClassifierConfig()
         self._log = logger.bind(agent="ProblemClassifier")
 
-    # === NAZWA_SEKCJI === WALIDACJA WEJŚCIA ===
+    # === WALIDACJA WEJŚCIA ===
     def validate_input(self, **kwargs) -> bool:
         """
         Validate input parameters.
@@ -122,8 +147,7 @@ class ProblemClassifier(BaseAgent):
 
         return True
 
-    # === NAZWA_SEKCJI === GŁÓWNE WYKONANIE ===
-    @_timeit("ProblemClassifier.execute")
+    # === GŁÓWNE WYKONANIE ===
     def execute(
         self,
         data: pd.DataFrame,
@@ -138,9 +162,10 @@ class ProblemClassifier(BaseAgent):
             target_column: Name of target column
 
         Returns:
-            AgentResult with problem classification payload
+            AgentResult with problem classification payload (kontrakt powyżej).
         """
         result = AgentResult(agent_name=self.name)
+        t0_total = time.perf_counter()
 
         try:
             # Walidacja obecności kolumny
@@ -150,7 +175,9 @@ class ProblemClassifier(BaseAgent):
                 self._log.error(msg)
                 return result
 
-            target = data[target_column]
+            # NA/Inf safety (nie modyfikujemy wejścia)
+            df = data.replace([np.inf, -np.inf], np.nan)
+            target = df[target_column]
 
             # Guard: pusty target lub brak niepustych wartości
             if target is None or len(target) == 0 or target.dropna().empty:
@@ -159,35 +186,50 @@ class ProblemClassifier(BaseAgent):
                 self._log.warning("empty target – cannot infer problem type.")
                 return result
 
-            # Detekcja typu problemu (Enum/string) + heurystyka awaryjna
-            detected = infer_problem_type(target)
+            # 1) Detekcja typu problemu z pomocą utilsa
+            detected = None
+            try:
+                detected = infer_problem_type(target)
+            except Exception as e:
+                self._log.debug(f"infer_problem_type failed: {e}")
+
             if isinstance(detected, ProblemType):
-                problem_type_str = "classification" if detected == ProblemType.CLASSIFICATION else "regression"
+                problem_type_str: Optional[str] = "classification" if detected == ProblemType.CLASSIFICATION else "regression"
             else:
-                problem_type_str = str(detected).lower().strip()
+                problem_type_str = str(detected).lower().strip() if detected is not None else None
 
-            # Heurystyka: jeśli większość wartości jest unikalna lub seria jest numeric-like → regresja
+            # 2) Heurystyczny fallback / korekta decyzji
             if problem_type_str not in ("classification", "regression"):
-                if _is_id_like(target, self.config.id_like_unique_ratio) or _is_numeric_series_like(target):
-                    problem_type_str = "regression"
-                else:
-                    # fallback do classification (bardziej bezpieczny dla stringowych celów)
-                    problem_type_str = "classification"
+                problem_type_str = self._fallback_problem_type(target)
+            else:
+                # korekta: numeric dtype, ale bardzo mało unikalnych → classification (np. {0,1,2})
+                if pd.api.types.is_numeric_dtype(target):
+                    nunique = int(target.nunique(dropna=True))
+                    if nunique <= self.config.small_unique_threshold:
+                        problem_type_str = "classification"
+                # korekta: object, ale numeric-like/ID-like → regression (chyba że „mało klas”)
+                elif _is_numeric_series_like(target) or _is_id_like(target, self.config.id_like_unique_ratio):
+                    nunique = int(target.nunique(dropna=True))
+                    problem_type_str = "classification" if nunique <= self.config.small_unique_threshold else "regression"
 
-            # Analiza targetu
+            if problem_type_str is None and not self.config.allow_none_problem_fallback:
+                # Bezpieczne domyślne: classification dla tekstowych, regression dla numeric-like
+                problem_type_str = "regression" if _is_numeric_series_like(target) else "classification"
+
+            # 3) Analiza targetu
             analysis = self._analyze_target(target, problem_type_str)
 
-            # Rekomendacje
-            recommendations = self._get_recommendations(target, problem_type_str, analysis)
+            # 4) Rekomendacje
+            recommendations = self._get_recommendations(problem_type_str, analysis)
 
-            # Zbiorczy kontrakt
+            # 5) Kontrakt (ściśle 1:1)
             result.data = {
                 "problem_type": problem_type_str,
                 "target_analysis": analysis,
                 "recommendations": recommendations,
             }
 
-            self._log.success(f"classified as: {problem_type_str}")
+            self._log.success(f"classified as: {problem_type_str} in {(time.perf_counter()-t0_total)*1000:.1f} ms")
 
         except Exception as e:
             result.add_error(f"Problem classification failed: {e}")
@@ -195,7 +237,28 @@ class ProblemClassifier(BaseAgent):
 
         return result
 
-    # === NAZWA_SEKCJI === PAYLOAD DLA PUSTEGO TARGETU ===
+    # === FALLBACK HEURYSTYCZNY ===
+    def _fallback_problem_type(self, target: pd.Series) -> Optional[str]:
+        """
+        Ostrożny fallback:
+          - numeric-like oraz/lub id-like → 'regression' (chyba że bardzo mało unikalnych)
+          - w przeciwnym razie 'classification'
+          - jeżeli allow_none_problem_fallback=True i niepewność wysoka → None
+        """
+        is_numeric_like = _is_numeric_series_like(target)
+        is_idlike = _is_id_like(target, self.config.id_like_unique_ratio)
+        nunique = int(target.nunique(dropna=True))
+
+        if is_numeric_like or is_idlike:
+            if nunique <= self.config.small_unique_threshold:
+                return "classification"
+            return "regression"
+
+        if not self.config.allow_none_problem_fallback:
+            return "classification"
+        return None
+
+    # === PAYLOAD DLA PUSTEGO TARGETU ===
     def _empty_payload_empty_target(self, target: Optional[pd.Series]) -> Dict[str, Any]:
         n = int(len(target)) if target is not None else 0
         n_missing = int(target.isna().sum()) if target is not None else 0
@@ -205,7 +268,7 @@ class ProblemClassifier(BaseAgent):
                 "n_samples": n,
                 "n_unique": int(target.nunique(dropna=True)) if target is not None else 0,
                 "n_missing": n_missing,
-                "missing_pct": float((n_missing / max(1, n)) * 100) if n > 0 else 0.0,
+                "missing_pct": float((n_missing / max(1, n)) * 100.0) if n > 0 else 0.0,
                 "error": "Target is empty or all values are missing"
             },
             "recommendations": {
@@ -217,17 +280,13 @@ class ProblemClassifier(BaseAgent):
             }
         }
 
-    # === NAZWA_SEKCJI === ANALIZA TARGETU (DYNA.) ===
-    def _analyze_target(
-        self,
-        target: pd.Series,
-        problem_type: str
-    ) -> Dict[str, Any]:
+    # === ANALIZA TARGETU (DYNA.) ===
+    def _analyze_target(self, target: pd.Series, problem_type: str) -> Dict[str, Any]:
         """Analyze target column in detail depending on problem type."""
         n = int(len(target))
         n_unique = int(target.nunique(dropna=True))
         n_missing = int(target.isna().sum())
-        missing_pct = float((n_missing / max(1, n)) * 100)
+        missing_pct = float((n_missing / max(1, n)) * 100.0)
 
         base = {
             "n_samples": n,
@@ -243,58 +302,54 @@ class ProblemClassifier(BaseAgent):
 
         return base
 
-    # === NAZWA_SEKCJI === ANALIZA DLA KLASYFIKACJI ===
+    # === ANALIZA: KLASYFIKACJA ===
     def _analyze_classification_target(self, target: pd.Series) -> Dict[str, Any]:
-        """Analyze classification target: liczba klas, rozkład, nierównowaga, rzadkie klasy."""
+        """Analyze classification target: liczba klas, rozkład, nierównowaga, rzadkie klasy, majority class."""
         cfg = self.config
 
-        # Rozkład (tylko nie-NaN jako „klasy”)
         vc_non_na = target.dropna().value_counts()
         n_classes = int(vc_non_na.shape[0])
 
-        is_binary = (n_classes == 2)
-        warnings: List[str] = []
-
-        if n_classes > 1:
+        warnings_local: List[str] = []
+        if n_classes <= 1:
+            imbalance_ratio = 1.0
+            is_imbalanced = False
+            warnings_local.append("Only one unique non-NA class found — model training may not be feasible.")
+        else:
             min_class = int(vc_non_na.min())
             max_class = int(vc_non_na.max())
             imbalance_ratio = float(max_class / max(1, min_class))
             is_imbalanced = imbalance_ratio > cfg.imbalance_ratio_threshold
             if is_imbalanced:
-                warnings.append(
+                warnings_local.append(
                     f"Class imbalance detected (ratio={imbalance_ratio:.2f} > {cfg.imbalance_ratio_threshold})"
                 )
-            # Rzadkie klasy
-            rare_classes = {str(k): int(v) for k, v in vc_non_na.items() if v < cfg.warn_min_samples_per_class}
-            if rare_classes:
-                warnings.append(
-                    f"Rare classes detected (<{cfg.warn_min_samples_per_class} samples): {list(rare_classes.keys())}"
+            rare = [str(k) for k, v in vc_non_na.items() if v < cfg.warn_min_samples_per_class]
+            if rare:
+                warnings_local.append(
+                    f"Rare classes detected (<{cfg.warn_min_samples_per_class} samples): {rare}"
                 )
-        else:
-            imbalance_ratio = 1.0
-            is_imbalanced = False
+            very_rare = [str(k) for k, v in vc_non_na.items() if v < cfg.rare_class_threshold]
+            if very_rare:
+                warnings_local.append(
+                    f"Very rare classes (<{cfg.rare_class_threshold} samples): {very_rare}"
+                )
 
-        # Majority class
-        if n_classes >= 1:
-            majority_class = str(vc_non_na.index[0])
-            majority_pct = float((vc_non_na.iloc[0] / max(1, len(target.dropna()))) * 100)
-        else:
-            majority_class = None
-            majority_pct = 0.0
-            warnings.append("Only one unique non-NA class found — model training may not be feasible.")
+        maj_label, maj_pct = _majority_label(vc_non_na)
+        classification_type = "binary" if n_classes == 2 else "multiclass" if n_classes > 2 else "single_class"
 
         return {
-            "classification_type": "binary" if is_binary else "multiclass" if n_classes > 1 else "single_class",
+            "classification_type": classification_type,
             "n_classes": n_classes,
             "class_distribution": {str(k): int(v) for k, v in vc_non_na.to_dict().items()},
-            "is_imbalanced": is_imbalanced,
+            "is_imbalanced": bool(is_imbalanced),
             "imbalance_ratio": float(imbalance_ratio),
-            "majority_class": majority_class,
-            "majority_class_pct": majority_pct,
-            "warnings": warnings,
+            "majority_class": maj_label,
+            "majority_class_pct": float(maj_pct),
+            "warnings": warnings_local,
         }
 
-    # === NAZWA_SEKCJI === ANALIZA DLA REGRESJI ===
+    # === ANALIZA: REGRESJA ===
     def _analyze_regression_target(self, target: pd.Series) -> Dict[str, Any]:
         """Analyze regression target: statystyki opisowe z guardami i konwersją numeric-like."""
         cfg = self.config
@@ -306,22 +361,18 @@ class ProblemClassifier(BaseAgent):
                 "n_non_missing": int(len(target_clean))
             }
 
-        # Konwersja do float (numeric-like z obiektów)
-        t = target_clean
+        t = target_clean.copy()
         if cfg.treat_numeric_str_as_numeric and not pd.api.types.is_numeric_dtype(t):
-            try:
-                t = pd.to_numeric(target_clean.astype(str).str.replace(",", ".", regex=False), errors="coerce").dropna()
-            except Exception:
-                pass
+            t = _coerce_numeric_series(t)
 
+        # jeśli nadal nie numeric → spróbuj jeszcze raz
         if not pd.api.types.is_numeric_dtype(t):
-            # ostatni bezpiecznik
             try:
                 t = pd.to_numeric(t, errors="coerce").dropna()
             except Exception:
                 pass
 
-        if isinstance(t, pd.Series) and t.empty:
+        if isinstance(t, pd.Series) and t.dropna().empty:
             return {
                 "error": "Target values are non-numeric or cannot be coerced to numeric",
                 "n_non_missing": int(len(target_clean))
@@ -349,36 +400,16 @@ class ProblemClassifier(BaseAgent):
             "cv": cv,
         }
 
-    # === NAZWA_SEKCJI === REKOMENDACJE (DYNA.) ===
-    def _get_recommendations(
-        self,
-        target: pd.Series,
-        problem_type: str,
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    # === REKOMENDACJE (DYNA.) ===
+    def _get_recommendations(self, problem_type: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Build recommendations based on problem type and target analysis."""
-        rec = {
-            "problem_type": problem_type,
-            "suggested_metrics": [],
-            "preprocessing_steps": [],
-            "model_suggestions": [],
-            "warnings": [],
-        }
-
         if problem_type == "classification":
-            out = self._get_classification_recommendations(target, analysis)
+            return self._get_classification_recommendations(analysis)
         else:
-            out = self._get_regression_recommendations(target, analysis)
+            return self._get_regression_recommendations(analysis)
 
-        rec.update(out)
-        return rec
-
-    # === NAZWA_SEKCJI === REKOMENDACJE: KLASYFIKACJA ===
-    def _get_classification_recommendations(
-        self,
-        target: pd.Series,
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    # === REKOMENDACJE: KLASYFIKACJA ===
+    def _get_classification_recommendations(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
         cfg = self.config
         n_classes = int(analysis.get("n_classes", 0))
         is_imbalanced = bool(analysis.get("is_imbalanced", False))
@@ -393,11 +424,10 @@ class ProblemClassifier(BaseAgent):
         else:
             metrics = ["accuracy", "f1_weighted", "precision_weighted", "recall_weighted", "log_loss"]
 
-        if is_imbalanced and "balanced_accuracy" not in metrics:
-            metrics.append("balanced_accuracy")
-        # Dodatkowo przy skrajnej nierównowadze:
         if is_imbalanced:
-            metrics += ["mcc", "auprc"]
+            for m in ("balanced_accuracy", "mcc", "auprc"):
+                if m not in metrics:
+                    metrics.append(m)
 
         # Preprocessing
         preprocessing = [
@@ -406,7 +436,7 @@ class ProblemClassifier(BaseAgent):
             "Use stratified train/validation split",
         ]
         if is_imbalanced:
-            preprocessing.append("Apply SMOTE/SMOTEENN or class weighting")
+            preprocessing.extend(["Apply SMOTE/SMOTEENN or class weighting", "Tune threshold using PR/ROC curves"])
 
         # Models
         if n_classes <= 1:
@@ -418,7 +448,7 @@ class ProblemClassifier(BaseAgent):
                 "XGBoost",
                 "LightGBM",
                 "CatBoost",
-                "Linear/Kernel SVM (z uwagą na skalowanie)"
+                "Linear/Kernel SVM (po skalowaniu cech)"
             ]
         else:
             models = [
@@ -426,22 +456,19 @@ class ProblemClassifier(BaseAgent):
                 "XGBoost",
                 "LightGBM",
                 "CatBoost",
-                "Linear/Kernel SVM (One-vs-Rest)",
+                "Linear/Kernel SVM (One-vs-Rest, po skalowaniu)"
             ]
 
         return {
+            "problem_type": "classification",
             "suggested_metrics": metrics,
             "preprocessing_steps": preprocessing,
             "model_suggestions": models,
             "warnings": warnings_local,
         }
 
-    # === NAZWA_SEKCJI === REKOMENDACJE: REGRESJA ===
-    def _get_regression_recommendations(
-        self,
-        target: pd.Series,
-        analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    # === REKOMENDACJE: REGRESJA ===
+    def _get_regression_recommendations(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
         cfg = self.config
         warnings_local: List[str] = []
 
@@ -476,6 +503,7 @@ class ProblemClassifier(BaseAgent):
         ]
 
         return {
+            "problem_type": "regression",
             "suggested_metrics": metrics,
             "preprocessing_steps": preprocessing,
             "model_suggestions": models,
