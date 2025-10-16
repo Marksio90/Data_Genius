@@ -1,18 +1,19 @@
 # === logging_config.py ===
 """
-DataGenius PRO - Logging Configuration (PRO++++++)
+DataGenius PRO - Logging Configuration (ENTERPRISE PRO++++++)
 Centralny setup logowania: konsola, pliki, JSONL, redakcja sekretów, kontekst żądań
-oraz przechwycenie stdlib logging do loguru.
+oraz przechwycenie stdlib logging -> loguru. Wersja enterprise:
+- Stabilna inicjalizacja idempotentna (wielokrotne wywołania nie duplikują sinków),
+- ContextVars (request_id/user_id/run_id, session_id) z helperami i dekoratorami,
+- Redakcja sekretów w message/extra (rekurencyjna, bezpieczna dla dict/list/JSON str),
+- Oddzielne sinki: app.log, errors.log, agents.log, (opcjonalnie) app.jsonl,
+- Przechwycenie stdlib (uvicorn/fastapi/sqlalchemy itp.), warnings → loguru,
+- Dekoratory sync/async: log_execution_time, log_agent_activity, log_exceptions,
+- Per-run sinki (run-<id>.log/jsonl) + zarządzanie ich życiem (ID sinków),
+- Dynamiczna zmiana poziomu logów (set_log_level) i atomiczne przełączanie,
+- Zgodność wsteczna z poprzednią wersją modułu.
 
-Kluczowe:
-- setup_logging(): konsola + app.log + errors.log + agents.log + (opcjonalnie) app.jsonl
-- InterceptHandler: stdlib -> loguru (uvicorn/fastapi/sqlalchemy itp.)
-- Redakcja sekretów w message i extra (rekurencyjnie)
-- ContextVars: request_id/user_id/run_id i helpery do ustawiania
-- Dekoratory: log_execution_time, log_agent_activity, log_exceptions
-- add_run_file_sinks(): dodatkowe sinki dla pojedynczego “run”
-
-Bezpieczny fallback na settings (bez side-effectów w testach).
+Bez dodatkowych zależności poza loguru.
 """
 
 from __future__ import annotations
@@ -23,8 +24,9 @@ import json
 import logging
 import warnings
 from pathlib import Path
-from datetime import datetime
-from typing import Optional, Dict, Any, Iterable, Tuple, List, Union
+from typing import Optional, Dict, Any, List, Union, Iterable, Callable, Tuple
+from contextvars import ContextVar
+from functools import wraps
 
 from loguru import logger, Logger
 
@@ -44,24 +46,35 @@ except Exception:  # pragma: no cover
     settings = _FallbackSettings()  # type: ignore
 
 
-# === Context variables (request/run) ===
-from contextvars import ContextVar
+# === Context variables (request/session/run) ===
 _ctx_request_id: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 _ctx_user_id: ContextVar[Optional[str]] = ContextVar("user_id", default=None)
 _ctx_run_id: ContextVar[Optional[str]] = ContextVar("run_id", default=None)
+_ctx_session_id: ContextVar[Optional[str]] = ContextVar("session_id", default=None)
 
-def set_request_context(*, request_id: Optional[str] = None, user_id: Optional[str] = None, run_id: Optional[str] = None) -> None:
+def set_request_context(
+    *,
+    request_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> None:
+    """Ustawia ContextVars dla bieżącego kontekstu."""
     if request_id is not None:
         _ctx_request_id.set(request_id)
     if user_id is not None:
         _ctx_user_id.set(user_id)
     if run_id is not None:
         _ctx_run_id.set(run_id)
+    if session_id is not None:
+        _ctx_session_id.set(session_id)
 
 def clear_request_context() -> None:
+    """Czyści ContextVars (np. na końcu żądania)."""
     _ctx_request_id.set(None)
     _ctx_user_id.set(None)
     _ctx_run_id.set(None)
+    _ctx_session_id.set(None)
 
 
 # === Intercept stdlib -> loguru ===
@@ -84,6 +97,7 @@ class InterceptHandler(logging.Handler):
             "request_id": _ctx_request_id.get(),
             "user_id": _ctx_user_id.get(),
             "run_id": _ctx_run_id.get(),
+            "session_id": _ctx_session_id.get(),
             "module": record.module,
         }
         logger.bind(**{k: v for k, v in extra.items() if v is not None}) \
@@ -98,6 +112,8 @@ _SECRET_PATTERNS = [
     re.compile(r"(?i)(token\s*[:=]\s*)([A-Za-z0-9_\-\.]{12,})"),
     re.compile(r"(?i)(authorization\s*:\s*Bearer\s+)([A-Za-z0-9\.\-_]+)"),
     re.compile(r"(?i)(password\s*[:=]\s*)([^&\s]+)"),
+    # ogólny klucz w JSON: "secret": "...."
+    re.compile(r'(?i)("?(secret|passwd|pwd)"?\s*[:=]\s*"?)([^"\s]{6,})"?'),
 ]
 
 def _redact_str(message: str) -> str:
@@ -107,9 +123,15 @@ def _redact_str(message: str) -> str:
     return red
 
 def _redact_obj(obj: Any) -> Any:
-    # Rekurencyjna redakcja w strukturach
+    """Rekurencyjna redakcja w strukturach; obsługuje JSON string → dict/list."""
     if isinstance(obj, str):
-        return _redact_str(obj)
+        # jeśli to JSON, spróbuj sparsować i zredagować strukturalnie
+        try:
+            parsed = json.loads(obj)
+            redacted = _redact_obj(parsed)
+            return json.dumps(redacted, ensure_ascii=False)
+        except Exception:
+            return _redact_str(obj)
     if isinstance(obj, dict):
         return {k: _redact_obj(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -117,7 +139,7 @@ def _redact_obj(obj: Any) -> Any:
     return obj
 
 def _patch_record(record: Dict[str, Any]) -> None:
-    # Merged extra: dodaj context vars
+    # Merged extra: dodaj ContextVars
     extra = record.get("extra") or {}
     if _ctx_request_id.get():
         extra.setdefault("request_id", _ctx_request_id.get())
@@ -125,12 +147,14 @@ def _patch_record(record: Dict[str, Any]) -> None:
         extra.setdefault("user_id", _ctx_user_id.get())
     if _ctx_run_id.get():
         extra.setdefault("run_id", _ctx_run_id.get())
+    if _ctx_session_id.get():
+        extra.setdefault("session_id", _ctx_session_id.get())
 
     # Redakcja message/extra
     if isinstance(record.get("message"), str):
         record["message"] = _redact_str(record["message"])
     # typowe pola payload/headers/body + wszystko rekurencyjnie
-    for key in ("payload", "body", "headers", "params", "query"):
+    for key in ("payload", "body", "headers", "params", "query", "response"):
         if key in extra:
             extra[key] = _redact_obj(extra[key])
     record["extra"] = extra
@@ -138,9 +162,7 @@ def _patch_record(record: Dict[str, Any]) -> None:
 
 # === Filtry ===
 def _agents_filter(rec: Dict[str, Any]) -> bool:
-    """
-    Filtruje wpisy powiązane z agentami (nazwy lub extra.component/agent).
-    """
+    """Filtruje wpisy powiązane z agentami (nazwy lub extra.component/agent)."""
     name = (rec.get("name") or "").lower()
     extra = rec.get("extra") or {}
     comp = str(extra.get("component", "")).lower()
@@ -152,9 +174,10 @@ def _agents_filter(rec: Dict[str, Any]) -> bool:
 LOG_FORMAT_HUMAN = (
     "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
     "<level>{level: <8}</level> | "
-    "pid={process} | "
+    "pid={process} tid={thread} | "
     "<cyan>{module}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-    "req=<blue>{extra[request_id]}</blue> run=<blue>{extra[run_id]}</blue> user=<blue>{extra[user_id]}</blue> | "
+    "req=<blue>{extra[request_id]}</blue> run=<blue>{extra[run_id]}</blue> "
+    "user=<blue>{extra[user_id]}</blue> sess=<blue>{extra[session_id]}</blue> | "
     "<magenta>{extra}</magenta> | "
     "<level>{message}</level>"
 )
@@ -162,6 +185,13 @@ LOG_FORMAT_HUMAN = (
 LOG_FORMAT_COMPACT = (
     "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | pid={process} | {message}"
 )
+
+
+# === Idempotentny setup (przechowujemy ID sinków) ===
+_INITIALIZED_FLAG = False
+_SINK_IDS: List[int] = []
+# rejestr dodatkowych run-sinków: run_id -> [sink_ids]
+_RUN_SINKS: Dict[str, List[int]] = {}
 
 
 # === Główna konfiguracja ===
@@ -172,19 +202,24 @@ def setup_logging(
     enable_json: Optional[bool] = None,
     console_compact: Optional[bool] = None,
     logs_path: Optional[Union[str, Path]] = None,
+    reset_existing: bool = False,
 ) -> None:
     """
-    Inicjalizuje centralny system logowania.
+    Inicjalizuje centralny system logowania (idempotentnie).
+    Jeśli reset_existing=True, usuwa istniejące sinki i konfiguruje od nowa.
 
     Args:
         app_name: Nazwa aplikacji (domyślnie settings.APP_NAME)
         log_level: Poziom logowania (DEBUG/INFO/WARNING/ERROR/CRITICAL)
         enable_json: Włącza JSONL sink (domyślnie settings.LOG_JSON_ENABLED=True)
         console_compact: Uproszczony format w konsoli
-        logs_path: Ścieżka do katalogu logów (domyślnie settings.LOGS_PATH)
+        logs_path: Ścieżka katalogu logów (domyślnie settings.LOGS_PATH)
+        reset_existing: Wymuś pełny re-setup bez względu na `_INITIALIZED_FLAG`
     """
+    global _INITIALIZED_FLAG, _SINK_IDS
+
     app_name = app_name or getattr(settings, "APP_NAME", "DataGenius PRO")
-    log_level = log_level or getattr(settings, "LOG_LEVEL", "INFO")
+    log_level = (log_level or getattr(settings, "LOG_LEVEL", "INFO")).upper()
     logs_dir: Path = Path(logs_path or getattr(settings, "LOGS_PATH", Path.cwd() / "logs")).resolve()
     rotation = getattr(settings, "LOG_ROTATION", "10 MB")
     retention = getattr(settings, "LOG_RETENTION", "30 days")
@@ -192,69 +227,39 @@ def setup_logging(
     test_mode = bool(getattr(settings, "TEST_MODE", False))
     console_compact = bool(getattr(settings, "LOG_CONSOLE_COMPACT", False)) if console_compact is None else console_compact
 
+    if _INITIALIZED_FLAG and not reset_existing:
+        # Już skonfigurowano – nic nie rób (bezpieczne dla wielokrotnego importu)
+        return
+
+    # Usuń dotychczasowe sinki (jeśli reset lub pierwszy raz)
+    try:
+        logger.remove()
+    except Exception:
+        pass
+    _SINK_IDS.clear()
+
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Usuń domyślne handlery
-    logger.remove()
-
     # Konsola (kolorowa)
-    logger.add(
-        sys.stdout,
-        format=LOG_FORMAT_COMPACT if console_compact else LOG_FORMAT_HUMAN,
-        level=log_level,
-        colorize=True,
-        backtrace=log_level == "DEBUG",
-        diagnose=False,   # True tylko przy głębokim debugowaniu
-        enqueue=True,     # bezpieczne dla wątków/procesów
-        patcher=_patch_record,
+    _SINK_IDS.append(
+        logger.add(
+            sys.stdout,
+            format=LOG_FORMAT_COMPACT if console_compact else LOG_FORMAT_HUMAN,
+            level=log_level,
+            colorize=True,
+            backtrace=(log_level == "DEBUG"),
+            diagnose=False,   # True tylko przy głębokim debugowaniu
+            enqueue=True,     # bezpieczne dla wątków/procesów
+            patcher=_patch_record,
+        )
     )
 
     if not test_mode:
         # Plik główny
-        logger.add(
-            logs_dir / "app.log",
-            format=LOG_FORMAT_HUMAN,
-            level=log_level,
-            rotation=rotation,
-            retention=retention,
-            compression="zip",
-            encoding="utf-8",
-            enqueue=True,
-            patcher=_patch_record,
-        )
-
-        # Plik błędów
-        logger.add(
-            logs_dir / "errors.log",
-            format=LOG_FORMAT_HUMAN,
-            level="ERROR",
-            rotation=rotation,
-            retention="90 days",
-            compression="zip",
-            encoding="utf-8",
-            enqueue=True,
-            patcher=_patch_record,
-        )
-
-        # Plik agentów
-        logger.add(
-            logs_dir / "agents.log",
-            format=LOG_FORMAT_HUMAN,
-            level="INFO",
-            rotation=rotation,
-            retention=retention,
-            compression="zip",
-            encoding="utf-8",
-            enqueue=True,
-            filter=_agents_filter,
-            patcher=_patch_record,
-        )
-
-        # JSONL (strukturalny)
-        if enable_json:
+        _SINK_IDS.append(
             logger.add(
-                logs_dir / "app.jsonl",
-                serialize=True,   # JSON na każdą linię
+                logs_dir / "app.log",
+                format=LOG_FORMAT_HUMAN,
                 level=log_level,
                 rotation=rotation,
                 retention=retention,
@@ -262,6 +267,54 @@ def setup_logging(
                 encoding="utf-8",
                 enqueue=True,
                 patcher=_patch_record,
+            )
+        )
+
+        # Plik błędów
+        _SINK_IDS.append(
+            logger.add(
+                logs_dir / "errors.log",
+                format=LOG_FORMAT_HUMAN,
+                level="ERROR",
+                rotation=rotation,
+                retention="90 days",
+                compression="zip",
+                encoding="utf-8",
+                enqueue=True,
+                patcher=_patch_record,
+            )
+        )
+
+        # Plik agentów
+        _SINK_IDS.append(
+            logger.add(
+                logs_dir / "agents.log",
+                format=LOG_FORMAT_HUMAN,
+                level="INFO",
+                rotation=rotation,
+                retention=retention,
+                compression="zip",
+                encoding="utf-8",
+                enqueue=True,
+                filter=_agents_filter,
+                patcher=_patch_record,
+            )
+        )
+
+        # JSONL (strukturalny)
+        if enable_json:
+            _SINK_IDS.append(
+                logger.add(
+                    logs_dir / "app.jsonl",
+                    serialize=True,   # JSON na każdą linię
+                    level=log_level,
+                    rotation=rotation,
+                    retention=retention,
+                    compression="zip",
+                    encoding="utf-8",
+                    enqueue=True,
+                    patcher=_patch_record,
+                )
             )
 
     # Przechwyć stdlib logging i warnings
@@ -278,6 +331,8 @@ def setup_logging(
     logger.bind(app=app_name)
     logger.info(f"Logging initialized for {app_name} (level={log_level}, json={enable_json}, logs_dir={str(logs_dir)})")
 
+    _INITIALIZED_FLAG = True
+
 
 # === Per-run sinki (np. workflow run) ===
 def add_run_file_sinks(run_id: str, run_dir: Path) -> List[int]:
@@ -290,9 +345,9 @@ def add_run_file_sinks(run_id: str, run_dir: Path) -> List[int]:
       - <run_dir>/run-{run_id}.jsonl
     """
     run_dir.mkdir(parents=True, exist_ok=True)
-    sink_ids: List[int] = []
+    ids: List[int] = []
 
-    sink_ids.append(
+    ids.append(
         logger.add(
             run_dir / f"run-{run_id}.log",
             format=LOG_FORMAT_HUMAN,
@@ -304,7 +359,7 @@ def add_run_file_sinks(run_id: str, run_dir: Path) -> List[int]:
             patcher=_patch_record,
         )
     )
-    sink_ids.append(
+    ids.append(
         logger.add(
             run_dir / f"run-{run_id}.jsonl",
             serialize=True,
@@ -316,7 +371,17 @@ def add_run_file_sinks(run_id: str, run_dir: Path) -> List[int]:
             patcher=_patch_record,
         )
     )
-    return sink_ids
+    _RUN_SINKS[run_id] = ids
+    return ids
+
+def remove_run_file_sinks(run_id: str) -> None:
+    """Usuwa wcześniej dodane sinki dla danego run_id."""
+    ids = _RUN_SINKS.pop(run_id, [])
+    for sid in ids:
+        try:
+            logger.remove(sid)
+        except Exception:
+            pass
 
 
 # === API pomocnicze ===
@@ -350,14 +415,33 @@ class LogContext:
         return False
 
 
-# === Dekoratory ===
-def log_execution_time(func):
-    """Loguje czas wykonania funkcji (INFO) z obsługą wyjątków (ERROR)."""
+# === Dekoratory (sync/async) ===
+def log_execution_time(func: Callable):
+    """
+    Loguje czas wykonania funkcji (INFO) z obsługą wyjątków (ERROR).
+    Wspiera funkcje synchroniczne i asynchroniczne.
+    """
     import time
-    from functools import wraps
+    import inspect
+
+    if inspect.iscoroutinefunction(func):
+        @wraps(func)
+        async def awrapper(*args, **kwargs):
+            start = time.perf_counter()
+            logger.info(f"Starting {func.__name__}")
+            try:
+                res = await func(*args, **kwargs)
+                dur = time.perf_counter() - start
+                logger.info(f"Completed {func.__name__} in {dur:.3f}s")
+                return res
+            except Exception as e:
+                dur = time.perf_counter() - start
+                logger.error(f"Failed {func.__name__} after {dur:.3f}s: {e}")
+                raise
+        return awrapper
 
     @wraps(func)
-    def wrapper(*args, **kwargs):
+    def swrapper(*args, **kwargs):
         start = time.perf_counter()
         logger.info(f"Starting {func.__name__}")
         try:
@@ -369,15 +453,30 @@ def log_execution_time(func):
             dur = time.perf_counter() - start
             logger.error(f"Failed {func.__name__} after {dur:.3f}s: {e}")
             raise
-    return wrapper
+    return swrapper
 
 
 def log_agent_activity(agent_name: str):
-    """Loguje aktywność agenta: start/sukces/porażka z bindowaniem 'agent'."""
-    def decorator(func):
-        from functools import wraps
+    """Loguje aktywność agenta: start/sukces/porażka z bindowaniem 'agent' (sync/async)."""
+    import inspect
+
+    def decorator(func: Callable):
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def awrapper(*args, **kwargs):
+                with LogContext(agent=agent_name, component="agent"):
+                    logger.info(f"[{agent_name}] Starting {func.__name__}")
+                    try:
+                        res = await func(*args, **kwargs)
+                        logger.success(f"[{agent_name}] Completed {func.__name__}")
+                        return res
+                    except Exception as e:
+                        logger.error(f"[{agent_name}] Failed {func.__name__}: {e}")
+                        raise
+            return awrapper
+
         @wraps(func)
-        def wrapper(*args, **kwargs):
+        def swrapper(*args, **kwargs):
             with LogContext(agent=agent_name, component="agent"):
                 logger.info(f"[{agent_name}] Starting {func.__name__}")
                 try:
@@ -387,35 +486,43 @@ def log_agent_activity(agent_name: str):
                 except Exception as e:
                     logger.error(f"[{agent_name}] Failed {func.__name__}: {e}")
                     raise
-        return wrapper
+        return swrapper
     return decorator
 
 
 def log_exceptions(level: str = "ERROR"):
-    """Dekorator: loguje wyjątki (bez mierzenia czasu)."""
-    def decorator(func):
-        from functools import wraps
+    """Dekorator: loguje wyjątki (bez mierzenia czasu). Obsługuje sync/async."""
+    import inspect
+
+    def decorator(func: Callable):
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def awrapper(*args, **kwargs):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    logger.log(level, f"Exception in {func.__name__}: {e}")
+                    raise
+            return awrapper
+
         @wraps(func)
-        def wrapper(*args, **kwargs):
+        def swrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
                 logger.log(level, f"Exception in {func.__name__}: {e}")
                 raise
-        return wrapper
+        return swrapper
     return decorator
 
 
 def set_log_level(level: str) -> None:
     """
     Zmienia poziom logowania w locie (dotyczy nowych wpisów; istniejące sinki zachowują filtry).
+    Re-konfiguruje konsolę/pliki idempotentnie z nowym poziomem.
     """
-    try:
-        logger.remove()
-    except Exception:
-        pass
-    # Re-setup konsoli z nowym poziomem i domyślną konfiguracją
-    setup_logging(log_level=level)
+    # Idempotentny re-setup
+    setup_logging(log_level=level, reset_existing=True)
 
 
 # === Inicjalizacja przy imporcie (bez side-effectów w testach) ===
@@ -426,6 +533,7 @@ if not bool(getattr(settings, "TEST_MODE", False)):  # pragma: no cover
 __all__ = [
     "setup_logging",
     "add_run_file_sinks",
+    "remove_run_file_sinks",
     "get_logger",
     "LogContext",
     "log_execution_time",
