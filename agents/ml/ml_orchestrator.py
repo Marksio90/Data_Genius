@@ -1,22 +1,37 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO++++ - ML Orchestrator (KOSMOS)
-Orkiestruje kompletny pipeline ML z:
-- deterministyką (globalny seed),
-- twardą walidacją wejścia i preflight sanity-checks,
-- kontrolą awarii per-agent + soft-timeout,
-- telemetry (czas, błędy, zużycie pamięci*, liczba wierszy/kolumn, wersje agentów),
-- opcjonalnym auto-wykryciem typu problemu,
-- hookami on_agent_start/on_agent_end,
-- stabilnym kontraktem wyników (ml_results + summary),
-- trybem „partial success” i limitami błędów,
-- lekkim limiterem pamięci* i sygnałami ostrzegawczymi.
+DataGenius PRO++++ - ML Orchestrator (KOSMOS, Enterprise)
 
-*monitoring pamięci w trybie best-effort (jeżeli psutil jest dostępny).
+Orkiestruje kompletny pipeline ML:
+- deterministyka (globalny seed),
+- twarda walidacja wejścia i preflight sanity-checks,
+- kontrola awarii per-agent + soft-timeout (bez kill),
+- telemetry: czasy, błędy, RSS (best-effort), rozmiar danych, wersje agentów,
+- opcjonalne auto-wykrycie typu problemu,
+- hooki on_agent_start/on_agent_end,
+- stabilny kontrakt wyników (ml_results + summary),
+- tryb „partial success” i limity błędów,
+- lekki limiter pamięci i sygnały ostrzegawcze.
+
+Kontrakt (fragmenty):
+result.data = {
+  "ml_results": {AgentName: agent_result_data, ...},
+  "summary": {
+      "best_model": str|None, "best_score": float|None,
+      "models_trained": int, "key_insights": List[str],
+      "timing_sec": {AgentName: float, "total": float},
+      "run_id": str, "seed": int, "problem_type": str, "target_column": str,
+      "n_rows": int, "n_cols": int, "agents": List[str], "agent_versions": Dict[str,str],
+      "partial_success": bool, "errors_seen": int, "memory_rss_mb": float|None,
+      "warnings": List[str], "started_at_ts": float, "finished_at_ts": float,
+      "version": str
+  }
+}
 """
 
 from __future__ import annotations
 
+# === NAZWA_SEKCJI === IMPORTY SYSTEMOWE ===
 import os
 import time
 import uuid
@@ -30,13 +45,13 @@ from loguru import logger
 from core.base_agent import PipelineAgent, AgentResult
 
 __all__ = ["MLConfig", "MLOrchestrator"]
-__version__ = "4.3-kosmos"
+__version__ = "5.1-kosmos-enterprise"
 
 
-# === KONFIG / PRZEŁĄCZNIKI ===
+# === NAZWA_SEKCJI === KONFIG / PRZEŁĄCZNIKI ===
 @dataclass(frozen=True)
 class MLConfig:
-    """Konfiguracja działania MLOrchestratora (PRO++++)."""
+    """Konfiguracja działania MLOrchestratora (Enterprise PRO)."""
     enabled_agents: Optional[List[str]] = None   # None => użyj wszystkich
     allow_partial: bool = True                   # kontynuuj, gdy pojedynczy agent zawiedzie
     strict_target_check: bool = True             # pilnuj targetu (braki/stała wartość)
@@ -50,23 +65,33 @@ class MLConfig:
     auto_detect_problem_type: bool = False       # spróbuj wykryć typ problemu z targetu
     # Limiter pamięci (best-effort; wymaga psutil). None = wyłącz.
     warn_rss_memory_mb: Optional[int] = 8_192    # ostrzegaj przy > 8 GB RSS
-    hard_stop_rss_memory_mb: Optional[int] = None  # jeśli ustawione i przekroczone — przerwij pipeline
+    hard_stop_rss_memory_mb: Optional[int] = None  # jeżeli ustawione i przekroczone — przerwij pipeline
+    # Nazwy agentów (dla spójności i testów)
+    selector_name: str = "ModelSelector"
+    trainer_name: str = "ModelTrainer"
+    evaluator_name: str = "ModelEvaluator"
+    explainer_name: str = "ModelExplainer"
 
 
+# === NAZWA_SEKCJI === KLASA GŁÓWNA ===
 class MLOrchestrator(PipelineAgent):
     """
-    Orchestrates complete ML training pipeline (PRO++++)
+    Orchestrates complete ML training pipeline (PRO++++).
+    Stabilny, defensywny, gotowy do produkcji.
     """
 
-    def __init__(self, config: Optional[MLConfig] = None):
+    def __init__(self, config: Optional[MLConfig] = None) -> None:
         # Lazy import agentów ML (unikanie cykli i ciężkich importów)
+        # Importy lokalne są odporne na brak modułu — błędy złapiemy przy konstrukcji.
         from agents.ml.model_selector import ModelSelector
         from agents.ml.model_trainer import ModelTrainer
         from agents.ml.model_evaluator import ModelEvaluator
         from agents.ml.model_explainer import ModelExplainer
 
         self.config = config or MLConfig()
+        self.logger = logger.bind(agent="MLOrchestrator")
 
+        # Zdefiniuj pełną listę agentów w domyślnej kolejności (deterministycznie)
         all_agents = [
             ModelSelector(),
             ModelTrainer(),
@@ -74,13 +99,19 @@ class MLOrchestrator(PipelineAgent):
             ModelExplainer(),
         ]
 
-        # Filtrowanie agentów wg configu (nazwy po .name lub class-name)
+        # Filtrowanie agentów wg configu (po .name lub class-name)
         if self.config.enabled_agents:
             name_set = set(self.config.enabled_agents)
-            agents = [a for a in all_agents if getattr(a, "name", a.__class__.__name__) in name_set]
-            missing = name_set - {getattr(a, "name", a.__class__.__name__) for a in all_agents}
+            agents = [
+                a for a in all_agents
+                if (getattr(a, "name", a.__class__.__name__) in name_set)
+                or (a.__class__.__name__ in name_set)
+            ]
+            missing = name_set - {
+                getattr(a, "name", a.__class__.__name__) for a in all_agents
+            }
             if missing:
-                logger.warning(f"Requested agents not found and will be ignored: {sorted(missing)}")
+                self.logger.warning(f"Requested agents not found and will be ignored: {sorted(missing)}")
         else:
             agents = all_agents
 
@@ -90,7 +121,7 @@ class MLOrchestrator(PipelineAgent):
             description="Complete ML training pipeline"
         )
 
-    # === WYKONANIE GŁÓWNE ===
+    # === NAZWA_SEKCJI === WYKONANIE GŁÓWNE ===
     def execute(
         self,
         data: pd.DataFrame,
@@ -113,49 +144,25 @@ class MLOrchestrator(PipelineAgent):
             **kwargs: forwardowane do agentów (np. parametry treningu)
 
         Returns:
-            AgentResult z:
-            {
-              "ml_results": {AgentName: data, ...},
-              "summary":    {
-                  "best_model": str|None,
-                  "best_score": float|None,
-                  "models_trained": int,
-                  "key_insights": List[str],
-                  "timing_sec": {AgentName: float, "total": float},
-                  "run_id": str,
-                  "seed": int,
-                  "problem_type": str,
-                  "target_column": str,
-                  "n_rows": int,
-                  "n_cols": int,
-                  "agents": List[str],
-                  "agent_versions": Dict[str,str],
-                  "partial_success": bool,
-                  "errors_seen": int,
-                  "memory_rss_mb": float|None,
-                  "warnings": List[str],
-                  "started_at_ts": float,
-                  "finished_at_ts": float,
-                  "version": str
-              }
-            }
+            AgentResult (kontrakt: patrz docstring modułu)
         """
         result = AgentResult(agent_name=self.name)
         started_at_ts = time.time()
 
         try:
-            # 0) Deterministyka (seed wewnętrzny; agenci mogą dodatkowo korzystać)
+            # 0) Deterministyka
             self._set_global_seed(self.config.random_seed)
 
             # 1) Walidacja wejścia + sanity checks
             df = self._validate_and_prepare(data, target_column)
-            # Opcjonalna auto-detekcja problemu
+
+            # 1a) Opcjonalna auto-detekcja problemu
             if self.config.auto_detect_problem_type:
                 problem_type = self._auto_detect_problem_type(df[target_column], default=problem_type)
 
             self.logger.info(
-                f"Starting ML pipeline for problem_type='{problem_type}' target='{target_column}' "
-                f"(rows={len(df)}, cols={len(df.columns)})"
+                f"Starting ML pipeline: problem_type='{problem_type}', target='{target_column}', "
+                f"rows={len(df)}, cols={len(df.columns)}"
             )
 
             # 2) Limiter pamięci (best-effort)
@@ -171,12 +178,14 @@ class MLOrchestrator(PipelineAgent):
                 result.data = {"pipeline_results": []}
                 return result
 
+            # Identyfikator biegu + timer całkowity
             run_id = f"mlrun_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
             t0 = time.perf_counter()
 
             # 3) Uruchomienie agentów (defensywnie, z soft-timeout)
             pipeline_results: List[AgentResult] = []
             timing_sec: Dict[str, float] = {}
+            agent_status: Dict[str, str] = {}  # "success"|"warning"|"error"
             errors_seen = 0
             versions: Dict[str, str] = {}
 
@@ -207,15 +216,18 @@ class MLOrchestrator(PipelineAgent):
                             f"Agent '{agent_label}' returned invalid result type: {type(agent_res)}"
                         )
 
+                    # klasyfikacja statusu agenta
                     if agent_res.errors:
                         msg = f"Agent '{agent_label}' reported errors: {agent_res.errors}"
                         if self.config.allow_partial:
                             self.logger.warning(msg)
+                            agent_status[agent_label] = "error"
                             errors_seen += 1
                         else:
                             raise RuntimeError(msg)
-
-                    self.logger.success(f"✔ Agent finished: {agent_label}")
+                    else:
+                        agent_status[agent_label] = "success"
+                        self.logger.success(f"✔ Agent finished: {agent_label}")
 
                 except Exception as e:
                     err_msg = f"Agent '{agent_label}' failed: {e}"
@@ -224,6 +236,7 @@ class MLOrchestrator(PipelineAgent):
                         failed = AgentResult(agent_name=agent_label)
                         failed.add_error(str(e))
                         agent_res = failed
+                        agent_status[agent_label] = "error"
                         errors_seen += 1
                     else:
                         raise
@@ -249,7 +262,7 @@ class MLOrchestrator(PipelineAgent):
                         warnings_list.append(stop_msg)
                         break
 
-            # 4) Spójność z PipelineAgent
+            # 4) Spójność z PipelineAgent: odpal dziedziczone execute (nie nadpisuje rezultatów agentów)
             pipeline_parent = super().execute(
                 data=df,
                 target_column=target_column,
@@ -284,6 +297,7 @@ class MLOrchestrator(PipelineAgent):
                     "started_at_ts": started_at_ts,
                     "finished_at_ts": finished_at_ts,
                     "version": __version__,
+                    "agent_status": agent_status,
                 })
 
                 result.data = {"ml_results": ml_results, "summary": summary}
@@ -299,7 +313,7 @@ class MLOrchestrator(PipelineAgent):
 
         return result
 
-    # === WALIDACJA + PREP ===
+    # === NAZWA_SEKCJI === WALIDACJA + PREP ===
     def _validate_and_prepare(self, df: pd.DataFrame, target_column: str) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise ValueError("'data' must be a pandas DataFrame")
@@ -311,24 +325,35 @@ class MLOrchestrator(PipelineAgent):
             raise ValueError(f"Target column '{target_column}' not found in DataFrame")
 
         # sanity: brak całych kolumn stałych (opcjonalny warning)
-        nunique = df.nunique(dropna=False)
-        constant_cols = nunique[nunique <= 1].index.tolist()
-        if constant_cols:
-            logger.warning(f"{len(constant_cols)} constant columns detected (e.g., {constant_cols[:3]}...). "
-                           f"Consider dropping before training.")
+        try:
+            nunique = df.nunique(dropna=False)
+            constant_cols = nunique[nunique <= 1].index.tolist()
+            if constant_cols:
+                logger.warning(
+                    f"{len(constant_cols)} constant columns detected (e.g., {constant_cols[:3]}...). "
+                    f"Consider dropping before training."
+                )
+        except Exception:
+            pass
 
         # target strict checks
         if self.config.strict_target_check:
             tgt = df[target_column]
-            n_missing = int(tgt.isna().sum())
+            try:
+                n_missing = int(tgt.isna().sum())
+            except Exception:
+                n_missing = 0
             if n_missing > 0:
                 logger.warning(f"Target column '{target_column}' contains {n_missing} missing values.")
-            if tgt.nunique(dropna=True) <= 1:
-                raise ValueError(f"Target column '{target_column}' has <=1 unique value; cannot train a model.")
+            try:
+                if tgt.nunique(dropna=True) <= 1:
+                    raise ValueError(f"Target column '{target_column}' has <=1 unique value; cannot train a model.")
+            except Exception:
+                pass
 
         return df
 
-    # === AUTO-DETEKCJA TYPU PROBLEMU (opcjonalna) ===
+    # === NAZWA_SEKCJI === AUTO-DETEKCJA TYPU PROBLEMU (opcjonalna) ===
     def _auto_detect_problem_type(self, y: pd.Series, default: str) -> str:
         try:
             n_unique = pd.Series(y).nunique(dropna=True)
@@ -344,7 +369,7 @@ class MLOrchestrator(PipelineAgent):
         except Exception:
             return default
 
-    # === AGREGACJA WYNIKÓW ===
+    # === NAZWA_SEKCJI === AGREGACJA WYNIKÓW ===
     def _aggregate_ml_results(self, pipeline_results: List[AgentResult]) -> Dict[str, Any]:
         """Aggregate results from all ML agents (bezpiecznie, odporne na braki)."""
         aggregated: Dict[str, Any] = {}
@@ -356,7 +381,7 @@ class MLOrchestrator(PipelineAgent):
                 logger.warning(f"Aggregation skipped for an agent due to error: {e}")
         return aggregated
 
-    # === PODSUMOWANIE ===
+    # === NAZWA_SEKCJI === PODSUMOWANIE ===
     def _generate_ml_summary(self, ml_results: Dict[str, Any]) -> Dict[str, Any]:
         """Generate summary of ML results (kompatybilne z raportami/mentorem)."""
         summary: Dict[str, Any] = {
@@ -367,32 +392,38 @@ class MLOrchestrator(PipelineAgent):
         }
 
         # Najlepszy model z ewaluacji
-        if "ModelEvaluator" in ml_results and isinstance(ml_results["ModelEvaluator"], dict):
-            eval_results = ml_results["ModelEvaluator"] or {}
-            summary["best_model"] = eval_results.get("best_model_name")
-            summary["best_score"] = eval_results.get("best_score")
+        try:
+            if "ModelEvaluator" in ml_results and isinstance(ml_results["ModelEvaluator"], dict):
+                eval_results = ml_results["ModelEvaluator"] or {}
+                summary["best_model"] = eval_results.get("best_model_name")
+                summary["best_score"] = eval_results.get("best_score")
+        except Exception:
+            pass
 
         # Liczba modeli porównanych w treningu
-        if "ModelTrainer" in ml_results and isinstance(ml_results["ModelTrainer"], dict):
-            trainer_results = ml_results["ModelTrainer"] or {}
-            models_cmp = trainer_results.get("models_comparison") or []
-            try:
-                summary["models_trained"] = len(models_cmp)
-            except Exception:
-                summary["models_trained"] = 0
+        try:
+            if "ModelTrainer" in ml_results and isinstance(ml_results["ModelTrainer"], dict):
+                trainer_results = ml_results["ModelTrainer"] or {}
+                models_cmp = trainer_results.get("models_comparison") or []
+                summary["models_trained"] = int(len(models_cmp)) if hasattr(models_cmp, "__len__") else 0
+        except Exception:
+            pass
 
         # Najważniejsze cechy z explainer
-        if "ModelExplainer" in ml_results and isinstance(ml_results["ModelExplainer"], dict):
-            explainer_results = ml_results["ModelExplainer"] or {}
-            top_features = explainer_results.get("top_features") or []
-            if top_features:
-                summary["key_insights"].append(
-                    f"Najważniejsze cechy: {', '.join(map(str, top_features[:3]))}"
-                )
+        try:
+            if "ModelExplainer" in ml_results and isinstance(ml_results["ModelExplainer"], dict):
+                explainer_results = ml_results["ModelExplainer"] or {}
+                top_features = explainer_results.get("top_features") or []
+                if top_features:
+                    summary["key_insights"].append(
+                        f"Najważniejsze cechy: {', '.join(map(str, top_features[:3]))}"
+                    )
+        except Exception:
+            pass
 
         return summary
 
-    # === DETERMINISTYKA ===
+    # === NAZWA_SEKCJI === DETERMINISTYKA ===
     def _set_global_seed(self, seed: int) -> None:
         try:
             np.random.seed(seed)
@@ -403,9 +434,9 @@ class MLOrchestrator(PipelineAgent):
             _r.seed(seed)
         except Exception:
             pass
-        # opcjonalnie torch/sklearn itp. — celowo pomijamy by unikać ciężkich importów
+        # (opcjonalnie torch/sklearn — celowo pomijamy by unikać ciężkich importów)
 
-    # === SOFT-TIMEOUT (bez kill) ===
+    # === NAZWA_SEKCJI === SOFT-TIMEOUT (bez kill) ===
     def _run_agent_with_soft_timeout(self, agent, timeout_s: Optional[float], **kwargs) -> AgentResult:
         """
         Uruchamia agent.execute(**kwargs). Jeżeli czas przekroczy timeout_s — loguje warning,
@@ -425,7 +456,7 @@ class MLOrchestrator(PipelineAgent):
                 name = getattr(agent, "name", agent.__class__.__name__)
                 logger.warning(f"Agent '{name}' exceeded soft-timeout ({elapsed:.1f}s > {timeout_s:.1f}s).")
 
-    # === RSS MEMORY (best-effort) ===
+    # === NAZWA_SEKCJI === RSS MEMORY (best-effort) ===
     def _rss_memory_mb(self) -> Optional[float]:
         try:
             import psutil  # type: ignore

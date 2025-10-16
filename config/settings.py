@@ -5,10 +5,12 @@ Type-safe config via Pydantic v2 + pydantic-settings, z walidacją
 i bezpiecznymi guardami dla środowiska produkcyjnego.
 
 Uwaga:
-- Dodano LOG_JSON_ENABLED/LOG_ROTATION/LOG_RETENTION (używane w logging_config.py)
-- Dodano API_KEY (używane w routes.verify_api_key)
-- Dodano API_MAX_ROWS/API_MAX_COLUMNS/API_MAX_CSV_BYTES (używane w schemas.py)
-- Dodano sanity-check LLM provider/model
+- LOG_JSON_ENABLED/LOG_ROTATION/LOG_RETENTION (logging_config.py)
+- API_KEY (routes.verify_api_key)
+- API_MAX_ROWS/API_MAX_COLUMNS/API_MAX_CSV_BYTES (schemas.py, routes.py)
+- SESSIONS_PATH/SESSION_TTL_HOURS/USE_PYARROW (session_manager.py)
+- RANDOM_STATE (ModelTrainer via TrainerConfig.random_state_key)
+- sanity-check LLM provider/model
 """
 
 from __future__ import annotations
@@ -51,8 +53,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = Field(default=None, repr=False)
     DEFAULT_LLM_PROVIDER: Literal["anthropic", "openai"] = "anthropic"
 
-    # Domyślny model zgodny z providerem (można nadpisać .env)
-    # Przy niespójności z DEFAULT_LLM_PROVIDER zostanie „samouzdrawiane” w validatorze.
+    # Domyślny model zgodny z providerem (auto-self-heal w validatorze)
     LLM_MODEL: str = "claude-3-5-sonnet-20240620"
     LLM_MAX_TOKENS: int = 4096
     LLM_TEMPERATURE: float = 0.7
@@ -83,11 +84,17 @@ class Settings(BaseSettings):
     REPORTS_PATH: Path = ROOT_DIR / "reports" / "exports"
     LOGS_PATH: Path = ROOT_DIR / "logs"
 
+    # Sesje (używane przez SessionManager)
+    SESSIONS_PATH: Path = ROOT_DIR / "sessions"
+    SESSION_TTL_HOURS: int = 12
+    USE_PYARROW: bool = True  # preferowany writer/czytnik DF-ów
+
     MAX_UPLOAD_SIZE_MB: int = 100
 
     # -------------------------------------------
     # === ML ===
     # -------------------------------------------
+    RANDOM_STATE: int = 42  # używane przez ModelTrainer (fallback seed)
     PYCARET_SESSION_ID: int = 42
     PYCARET_N_JOBS: int = -1
     PYCARET_FOLD: int = 5
@@ -134,10 +141,16 @@ class Settings(BaseSettings):
     # Do autoryzacji w FastAPI (routes.verify_api_key)
     API_KEY: Optional[str] = Field(default=None, repr=False)
 
-    # Limity na wejście (używane w schemas.py)
+    # Limity na wejście (używane w schemas.py i routes.py)
     API_MAX_ROWS: int = 2_000_000
     API_MAX_COLUMNS: int = 2_000
     API_MAX_CSV_BYTES: int = 25_000_000  # 25 MB
+
+    # CORS (opcjonalnie – przydatne dla UI)
+    CORS_ALLOW_ORIGINS: str = "*"  # CSV string lub *
+    CORS_ALLOW_CREDENTIALS: bool = True
+    CORS_ALLOW_METHODS: str = "GET,POST,PUT,DELETE,OPTIONS"
+    CORS_ALLOW_HEADERS: str = "Authorization,Content-Type,X-API-Key"
 
     # -------------------------------------------
     # === SECURITY ===
@@ -233,6 +246,7 @@ class Settings(BaseSettings):
         "MODELS_PATH",
         "REPORTS_PATH",
         "LOGS_PATH",
+        "SESSIONS_PATH",
         mode="before",
     )
     @classmethod
@@ -255,16 +269,21 @@ class Settings(BaseSettings):
         self._ensure_port_range("REDIS_PORT", self.REDIS_PORT)
         self._ensure_port_range("PROMETHEUS_PORT", self.PROMETHEUS_PORT)
 
-        # Guard na produkcję: klucze nie mogą być domyślne
+        # Guard: wymuś silne klucze w prod
         if self.is_production:
             insecure = ("change-me-in-production", "", None)
             if self.SECRET_KEY in insecure or self.JWT_SECRET_KEY in insecure:
                 raise ValueError("In production you must set strong SECRET_KEY and JWT_SECRET_KEY")
 
-        # Sanity provider ↔ model
+            # W prod wymagaj właściwego klucza dla wybranego providera
+            if self.DEFAULT_LLM_PROVIDER == "openai" and not self.OPENAI_API_KEY:
+                raise ValueError("DEFAULT_LLM_PROVIDER=openai but OPENAI_API_KEY not set")
+            if self.DEFAULT_LLM_PROVIDER == "anthropic" and not self.ANTHROPIC_API_KEY:
+                raise ValueError("DEFAULT_LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY not set")
+
+        # Sanity provider ↔ model (self-heal)
         lm = (self.LLM_MODEL or "").lower()
         if self.DEFAULT_LLM_PROVIDER == "openai" and "gpt" not in lm:
-            # samouzdrawianie – unikamy twardego faila przez złe .env
             self.LLM_MODEL = "gpt-4o"
         if self.DEFAULT_LLM_PROVIDER == "anthropic" and "claude" not in lm:
             self.LLM_MODEL = "claude-3-5-sonnet-20240620"

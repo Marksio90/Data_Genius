@@ -1,8 +1,8 @@
 # agents/monitoring/__init__.py
 """
-DataGenius PRO — monitoring package (lazy exports)
+DataGenius PRO — Monitoring package (lazy exports, Enterprise/KOSMOS)
 
-Eksporty:
+Eksporty (leniwe, stabilne):
 - DriftDetector / DriftConfig
 - PerformanceTracker / PerformanceConfig
 - RetrainingScheduler / RetrainPolicy
@@ -14,36 +14,87 @@ Użycie:
 
 from __future__ import annotations
 
-from importlib import import_module
+import importlib
+from dataclasses import dataclass
+from functools import lru_cache
 from types import ModuleType
-from typing import Dict, Tuple
+from typing import Any, Dict, Final, Tuple
 
-# mapowanie: symbol -> (moduł, nazwa_obiektu)
-_LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
+# ──────────────────────────────────────────────────────────────────────────────
+# KONFIGURACJA LENIWEGO EKSPORTU
+# Klucz = publiczna nazwa symbolu eksportowanego przez `agents.monitoring`.
+# Wartość = (pełna_ścieżka_modułu, nazwa_symbolu_w_modułowym_namespace)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class _LazySpec:
+    module: str
+    symbol: str
+
+_LAZY_EXPORTS: Dict[str, _LazySpec] = {
     # drift
-    "DriftDetector": ("agents.monitoring.drift_detector", "DriftDetector"),
-    "DriftConfig": ("agents.monitoring.drift_detector", "DriftConfig"),
+    "DriftDetector":   _LazySpec("agents.monitoring.drift_detector", "DriftDetector"),
+    "DriftConfig":     _LazySpec("agents.monitoring.drift_detector", "DriftConfig"),
 
     # performance tracking
-    "PerformanceTracker": ("agents.monitoring.performance_tracker", "PerformanceTracker"),
-    "PerformanceConfig": ("agents.monitoring.performance_tracker", "PerformanceConfig"),
+    "PerformanceTracker": _LazySpec("agents.monitoring.performance_tracker", "PerformanceTracker"),
+    "PerformanceConfig":  _LazySpec("agents.monitoring.performance_tracker", "PerformanceConfig"),
 
     # retraining scheduler
-    "RetrainingScheduler": ("agents.monitoring.retraining_scheduler", "RetrainingScheduler"),
-    "RetrainPolicy": ("agents.monitoring.retraining_scheduler", "RetrainPolicy"),
+    "RetrainingScheduler": _LazySpec("agents.monitoring.retraining_scheduler", "RetrainingScheduler"),
+    "RetrainPolicy":       _LazySpec("agents.monitoring.retraining_scheduler", "RetrainPolicy"),
 }
 
-__all__ = tuple(_LAZY_EXPORTS.keys())
+# Publiczny interfejs modułu
+__all__: Final[Tuple[str, ...]] = tuple(_LAZY_EXPORTS.keys())
 
-def __getattr__(name: str):
-    """Leniwe rozwiązywanie symboli i cache w module globals()."""
-    if name in _LAZY_EXPORTS:
-        mod_name, symbol = _LAZY_EXPORTS[name]
-        module: ModuleType = import_module(mod_name)
-        obj = getattr(module, symbol)
-        globals()[name] = obj  # cache na przyszłość
-        return obj
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+# ──────────────────────────────────────────────────────────────────────────────
+# IMPLEMENTACJA LENIWEGO ROZWIĄZYWANIA + CACHE
+# ──────────────────────────────────────────────────────────────────────────────
 
-def __dir__():
-    return sorted(list(globals().keys()) + list(_LAZY_EXPORTS.keys()))
+@lru_cache(maxsize=len(_LazySpec.__annotations__) or None)  # defensywny maxsize; i tak <= liczby eksportów
+def _resolve(name: str) -> Any:
+    """
+    Importuje moduł i pobiera symbol wskazany w _LAZY_EXPORTS.
+    Rezultat jest cache'owany (LRU) — zapobiega wielokrotnemu importowi
+    i jest bezpieczny na wyścigi przy równoległych importach.
+    """
+    spec = _LAZY_EXPORTS.get(name)
+    if spec is None:
+        # Konsekwentna semantyka AttributeError dla nieistniejących symboli.
+        raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+    try:
+        module: ModuleType = importlib.import_module(spec.module)
+    except Exception as e:
+        # Czytelniejszy komunikat, gdy moduł nie istnieje / ma błąd inicjalizacji
+        raise ImportError(
+            f"Failed to import module '{spec.module}' required for attribute '{name}'."
+        ) from e
+
+    try:
+        obj = getattr(module, spec.symbol)
+    except AttributeError as e:
+        raise AttributeError(
+            f"Module '{spec.module}' does not define expected attribute '{spec.symbol}' "
+            f"(needed for '{name}')."
+        ) from e
+
+    return obj
+
+
+def __getattr__(name: str) -> Any:  # PEP 562
+    """
+    Leniwe rozwiązywanie symboli + wstrzyknięcie do globals() po pierwszym użyciu.
+    """
+    obj = _resolve(name)
+    # Mikro-cache w module przyspiesza dostęp w kolejnych odczytach
+    globals()[name] = obj
+    return obj
+
+
+def __dir__() -> list[str]:
+    """
+    Zwraca standardowe atrybuty + nazwy dostępne przez leniwe eksporty (dla autocompletion).
+    """
+    return sorted(list(globals().keys()) + list(__all__))

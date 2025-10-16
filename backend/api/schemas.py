@@ -3,8 +3,9 @@
 DataGenius PRO - API Schemas (PRO++++++)
 Central contracts (Pydantic) + robust parsing/serialization utils.
 - Works with Pydantic v2 (preferred) and v1 (fallback).
-- JSON-safe encoders for numpy/pandas/plotly.
-- Defensive CSV size & shape limits.
+- JSON-safe encoders for numpy/pandas/plotly/datetimes.
+- Defensive CSV size & shape limits + separator sniffing.
+- Stable envelopes + helpers.
 """
 
 from __future__ import annotations
@@ -12,25 +13,33 @@ from __future__ import annotations
 import io
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Union, Literal
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 
-# ---- Settings / limits (safe fallbacks) --------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Settings / limits (safe fallbacks)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from config.settings import settings  # type: ignore
     API_MAX_ROWS: int = int(getattr(settings, "API_MAX_ROWS", 2_000_000))
     API_MAX_COLUMNS: int = int(getattr(settings, "API_MAX_COLUMNS", 2_000))
     API_MAX_CSV_BYTES: int = int(getattr(settings, "API_MAX_CSV_BYTES", 25_000_000))  # 25 MB
+    API_READ_CSV_KW: Dict[str, Any] = dict(
+        na_filter=True, low_memory=True, on_bad_lines="skip"
+    )
 except Exception:
     API_MAX_ROWS = 2_000_000
     API_MAX_COLUMNS = 2_000
     API_MAX_CSV_BYTES = 25_000_000
+    API_READ_CSV_KW = dict(na_filter=True, low_memory=True, on_bad_lines="skip")
 
-# ---- Pydantic v2 / v1 compatibility layer -----------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Pydantic v2 / v1 compatibility layer
+# ──────────────────────────────────────────────────────────────────────────────
 try:  # Pydantic v2
     from pydantic import BaseModel, Field, field_validator, ConfigDict
 
@@ -39,6 +48,8 @@ try:  # Pydantic v2
     class _NPFriendlyModel(BaseModel):
         model_config = ConfigDict(
             arbitrary_types_allowed=True,
+            # extra ignored so envelopes remain stable even if clients send more
+            extra="ignore",
             json_encoders={
                 # numpy
                 np.integer: int,
@@ -46,9 +57,14 @@ try:  # Pydantic v2
                 np.bool_: bool,
                 np.ndarray: lambda a: a.tolist(),
                 # pandas
-                pd.Timestamp: lambda ts: ts.isoformat(),
-                pd.Series: lambda s: s.tolist(),
-                pd.DataFrame: lambda df: json.loads(df.to_json(orient="records")),
+                pd.Timestamp: lambda ts: None if pd.isna(ts) else ts.isoformat(),
+                pd.Series: lambda s: s.where(pd.notnull(s), None).tolist(),
+                pd.DataFrame: lambda df: json.loads(
+                    df.where(pd.notnull(df), None).to_json(orient="records", date_format="iso")
+                ),
+                # datetime/date
+                datetime: lambda dt: dt.replace(tzinfo=timezone.utc).isoformat() if dt.tzinfo is None else dt.isoformat(),
+                date: lambda d: datetime(d.year, d.month, d.day, tzinfo=timezone.utc).isoformat(),
             },
         )
 
@@ -60,21 +76,30 @@ except Exception:  # Pydantic v1
     class _NPFriendlyModel(BaseModel):  # type: ignore
         class Config:
             arbitrary_types_allowed = True
+            extra = "ignore"
             json_encoders = {
                 np.integer: int,
                 np.floating: float,
                 np.bool_: bool,
                 np.ndarray: lambda a: a.tolist(),
-                pd.Timestamp: lambda ts: ts.isoformat(),
-                pd.Series: lambda s: s.tolist(),
-                pd.DataFrame: lambda df: json.loads(df.to_json(orient="records")),
+                pd.Timestamp: lambda ts: None if pd.isna(ts) else ts.isoformat(),
+                pd.Series: lambda s: s.where(pd.notnull(s), None).tolist(),
+                pd.DataFrame: lambda df: json.loads(
+                    df.where(pd.notnull(df), None).to_json(orient="records", date_format="iso")
+                ),
+                datetime: lambda dt: dt.replace(tzinfo=timezone.utc).isoformat() if dt.tzinfo is None else dt.isoformat(),
+                date: lambda d: datetime(d.year, d.month, d.day, tzinfo=timezone.utc).isoformat(),
             }
 
-# ---- Literals / enums --------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Literals / enums
+# ──────────────────────────────────────────────────────────────────────────────
 ProblemTypeEnum = Literal["classification", "regression"]
 ReportFormatEnum = Literal["html", "pdf", "markdown"]
 
-# ---- Models ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Models
+# ──────────────────────────────────────────────────────────────────────────────
 class DataPayload(_NPFriendlyModel):
     """
     Flexible data payload:
@@ -150,17 +175,39 @@ class StandardResponse(_NPFriendlyModel):
     request_id: str
     ts: str
 
-# ---- Utils: time/json/serialization -----------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Utils: time/json/serialization
+# ──────────────────────────────────────────────────────────────────────────────
 def now_iso() -> str:
     """UTC ISO-8601 (seconds)."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _jsonize_primitive(v: Any) -> Any:
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        # cast NaN/Inf to None to keep API JSON-clean
+        fl = float(v)
+        return None if (np.isnan(fl) or np.isinf(fl)) else fl
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    if isinstance(v, (datetime, pd.Timestamp)):
+        if pd.isna(v):
+            return None
+        return v.isoformat() if getattr(v, "tzinfo", None) else v.replace(tzinfo=timezone.utc).isoformat()
+    if isinstance(v, (date,)):
+        return datetime(v.year, v.month, v.day, tzinfo=timezone.utc).isoformat()
+    return v
+
 
 def safe_jsonify(obj: Any) -> Any:
     """
     Safe, recursive JSON-ification:
       - plotly.Figure -> dict (JSON)
-      - pandas DataFrame/Series -> records/list
+      - pandas DataFrame/Series -> records/list (NaN/NaT -> None)
       - numpy -> native Python types
+      - datetime/date -> ISO
       - nested dict/list handled recursively
     """
     # plotly Figure → JSON dict
@@ -174,28 +221,43 @@ def safe_jsonify(obj: Any) -> Any:
     # pandas
     if isinstance(obj, pd.DataFrame):
         try:
-            return json.loads(obj.to_json(orient="records"))
+            return json.loads(
+                obj.where(pd.notnull(obj), None).to_json(orient="records", date_format="iso")
+            )
         except Exception as e:
             logger.warning(f"DataFrame JSON conversion failed: {e}")
-            return obj.to_dict(orient="records")
+            return obj.where(pd.notnull(obj), None).to_dict(orient="records")
     if isinstance(obj, pd.Series):
-        return obj.tolist()
+        return [safe_jsonify(x) for x in obj.where(pd.notnull(obj), None).tolist()]
 
     # numpy
     if isinstance(obj, np.generic):
-        return obj.item()
+        return _jsonize_primitive(obj)
     if isinstance(obj, np.ndarray):
-        return obj.tolist()
+        return [safe_jsonify(x) for x in obj.tolist()]
+
+    # datetime / primitives
+    if isinstance(obj, (datetime, pd.Timestamp, date)):
+        return _jsonize_primitive(obj)
 
     # containers
     if isinstance(obj, dict):
-        return {k: safe_jsonify(v) for k, v in obj.items()}
+        return {str(k): safe_jsonify(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [safe_jsonify(v) for v in obj]
 
     return obj
 
-# ---- Utils: parsing ----------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Utils: CSV parsing
+# ──────────────────────────────────────────────────────────────────────────────
+def _detect_sep(sample: str) -> str:
+    """Lightweight separator sniffing over a sample."""
+    candidates = [";", "|", "\t", ","]
+    counts = {sep: sample.count(sep) for sep in candidates}
+    return max(counts, key=counts.get) if counts else ","
+
+
 @dataclass(frozen=True)
 class ParsedInfo:
     shape: tuple
@@ -203,18 +265,21 @@ class ParsedInfo:
     memory_mb: float
     n_missing: int
 
+
 def parse_payload_to_df(payload: DataPayload) -> pd.DataFrame:
     """
     Parse DataPayload -> DataFrame with defensive validation & limits.
       - records: direct DataFrame
-      - csv_text: pandas read_csv on StringIO (UTF-8)
+      - csv_text: pandas read_csv on StringIO (UTF-8) with separator sniffing
     """
     try:
         if payload.records:
             df = pd.DataFrame(payload.records)
         else:
             assert isinstance(payload.csv_text, str)
-            df = pd.read_csv(io.StringIO(payload.csv_text))
+            sniff = payload.csv_text[:2000]
+            sep = _detect_sep(sniff)
+            df = pd.read_csv(io.StringIO(payload.csv_text), sep=sep, **API_READ_CSV_KW)
     except Exception as e:
         logger.error(f"parse_payload_to_df: failed: {e}")
         raise ValueError(f"Invalid data payload: {e}")
@@ -234,10 +299,22 @@ def parse_payload_to_df(payload: DataPayload) -> pd.DataFrame:
     except Exception:
         pass
 
+    # light date parsing for date-like columns
+    for c in df.columns:
+        try:
+            if df[c].dtype == object:
+                low = str(c).lower()
+                if any(k in low for k in ("date", "time", "dt", "timestamp")):
+                    df[c] = pd.to_datetime(df[c], errors="ignore")
+        except Exception:
+            pass
+
     logger.info(f"Parsed DataFrame shape={df.shape}, columns={len(df.columns)}")
     return df
 
-# ---- Exports -----------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Exports
+# ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
     "ProblemTypeEnum",
     "ReportFormatEnum",

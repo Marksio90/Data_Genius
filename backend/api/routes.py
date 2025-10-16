@@ -1,6 +1,6 @@
 # === routes.py ===
 """
-DataGenius PRO - API Routes (PRO++++++)
+DataGenius PRO - API Routes (Enterprise / KOSMOS)
 Stabilne REST API do EDA, raportów, targetu, pipeline'u i pełnej orkiestracji ML.
 
 Wymaga: fastapi, pydantic, pandas, numpy, loguru (opcjonalnie: plotly)
@@ -13,11 +13,11 @@ import json
 import uuid
 import time
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Header
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Header, Request
 from fastapi import status as http_status
 from pydantic import BaseModel, Field, validator
 from loguru import logger
@@ -119,7 +119,7 @@ class StandardResponse(BaseModel):
     ts: str
 
 
-# === UTYLITY: PARSING, SERIALIZACJA ===
+# === UTYLITY: PARSING, SERIALIZACJA, LOGI ===
 def _now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -236,6 +236,24 @@ def envelope_err(msgs: List[str], status_code: int = 500) -> None:
     raise HTTPException(status_code=status_code, detail={"errors": msgs})
 
 
+def _agent_ok_or_500(agent_name: str, res) -> Dict[str, Any]:
+    """Ujednolicona walidacja wyniku agenta; rzuca 500 jeżeli porażka."""
+    try:
+        is_success = res.is_success()
+    except Exception:
+        is_success = False
+    if not is_success:
+        errors = []
+        try:
+            errors = res.errors or []
+        except Exception:
+            pass
+        if not errors:
+            errors = [f"{agent_name} failed"]
+        envelope_err(errors, 500)
+    return res.data
+
+
 # === ROUTES: HEALTH ===
 @router.get("/health", response_model=StandardResponse)
 def health(_: None = Depends(verify_api_key)) -> StandardResponse:
@@ -249,7 +267,7 @@ def health(_: None = Depends(verify_api_key)) -> StandardResponse:
 
 # === ROUTES: DATA PREVIEW/UPLOAD ===
 @router.post("/v1/data/preview", response_model=StandardResponse)
-def data_preview(payload: DataPayload, _: None = Depends(verify_api_key)) -> StandardResponse:
+def data_preview(payload: DataPayload, request: Request, _: None = Depends(verify_api_key)) -> StandardResponse:
     t0 = time.perf_counter()
     df = parse_payload_to_df(payload)
     info = {
@@ -260,6 +278,9 @@ def data_preview(payload: DataPayload, _: None = Depends(verify_api_key)) -> Sta
         "n_missing": int(df.isna().sum().sum()),
         "elapsed_s": round(time.perf_counter() - t0, 4),
     }
+    logger.bind(route="/v1/data/preview", request_id=str(id(request))).info(
+        f"Preview: rows={df.shape[0]} cols={df.shape[1]} miss={info['n_missing']}"
+    )
     return envelope_ok(info)
 
 
@@ -297,9 +318,8 @@ def schema_analyze(payload: DataPayload, _: None = Depends(verify_api_key)) -> S
     df = parse_payload_to_df(payload)
     agent = SchemaAnalyzer()
     res = agent.execute(data=df)
-    if not res.is_success():
-        envelope_err(res.errors or ["Schema analysis failed"], 500)
-    return envelope_ok({"SchemaAnalyzer": res.data})
+    data = _agent_ok_or_500("SchemaAnalyzer", res)
+    return envelope_ok({"SchemaAnalyzer": data})
 
 
 @router.post("/v1/profile", response_model=StandardResponse)
@@ -307,9 +327,8 @@ def data_profile(payload: DataPayload, _: None = Depends(verify_api_key)) -> Sta
     df = parse_payload_to_df(payload)
     agent = DataProfiler()
     res = agent.execute(data=df)
-    if not res.is_success():
-        envelope_err(res.errors or ["Data profiling failed"], 500)
-    return envelope_ok({"DataProfiler": res.data})
+    data = _agent_ok_or_500("DataProfiler", res)
+    return envelope_ok({"DataProfiler": data})
 
 
 # === ROUTES: PROBLEM / TARGET ===
@@ -320,17 +339,15 @@ def problem_classify(payload: DataPayload, _: None = Depends(verify_api_key)) ->
         envelope_err(["'target_column' is required"], 422)
     agent = ProblemClassifier()
     res = agent.execute(data=df, target_column=payload.target_column)
-    if not res.is_success():
-        envelope_err(res.errors or ["Problem classification failed"], 500)
-    return envelope_ok({"ProblemClassifier": res.data})
+    data = _agent_ok_or_500("ProblemClassifier", res)
+    return envelope_ok({"ProblemClassifier": data})
 
 
 @router.post("/v1/target/detect", response_model=StandardResponse)
 def target_detect(payload: DataPayload, _: None = Depends(verify_api_key)) -> StandardResponse:
     df = parse_payload_to_df(payload)
     schema = SchemaAnalyzer().execute(data=df)
-    if not schema.is_success():
-        envelope_err(schema.errors or ["Schema analysis failed"], 500)
+    _agent_ok_or_500("SchemaAnalyzer", schema)
 
     agent = TargetDetector()
     res = agent.execute(
@@ -338,9 +355,8 @@ def target_detect(payload: DataPayload, _: None = Depends(verify_api_key)) -> St
         column_info=schema.data.get("columns", []),
         user_target=payload.target_column,
     )
-    if not res.is_success():
-        envelope_err(res.errors or ["Target detection failed"], 500)
-    return envelope_ok({"TargetDetector": res.data})
+    data = _agent_ok_or_500("TargetDetector", res)
+    return envelope_ok({"TargetDetector": data})
 
 
 # === ROUTES: EDA ===
@@ -352,6 +368,7 @@ def eda_run(req: EDARequest, _: None = Depends(verify_api_key)) -> StandardRespo
     target_col = req.target_override or req.target_column
     if not target_col and req.problem_type_hint:
         schema = SchemaAnalyzer().execute(data=df)
+        _agent_ok_or_500("SchemaAnalyzer", schema)
         targ = TargetDetector().execute(
             data=df,
             column_info=schema.data.get("columns", []),
@@ -362,10 +379,8 @@ def eda_run(req: EDARequest, _: None = Depends(verify_api_key)) -> StandardRespo
 
     agent = EDAOrchestrator()
     res = agent.execute(data=df, target_column=target_col)
-    if not res.is_success():
-        envelope_err(res.errors or ["EDA pipeline failed"], 500)
-
-    return envelope_ok({"eda_results": res.data})
+    data = _agent_ok_or_500("EDAOrchestrator", res)
+    return envelope_ok({"eda_results": data})
 
 
 @router.post("/v1/eda/report", response_model=StandardResponse)
@@ -376,9 +391,8 @@ def eda_report(req: ReportRequest, _: None = Depends(verify_api_key)) -> Standar
         data_info=req.data_info,
         format=req.format,
     )
-    if not res.is_success():
-        envelope_err(res.errors or ["Report generation failed"], 500)
-    return envelope_ok({"report": res.data})
+    data = _agent_ok_or_500("ReportGenerator", res)
+    return envelope_ok({"report": data})
 
 
 # === ROUTES: PIPELINE PREPROCESSING ===
@@ -401,9 +415,8 @@ def pipeline_build(req: PipelineRequest, _: None = Depends(verify_api_key)) -> S
         target_column=req.target_column,   # type: ignore[arg-type]
         problem_type=problem_type          # type: ignore[arg-type]
     )
-    if not res.is_success():
-        envelope_err(res.errors or ["Pipeline building failed"], 500)
-    return envelope_ok({"pipeline": res.data})
+    data = _agent_ok_or_500("PipelineBuilder", res)
+    return envelope_ok({"pipeline": data})
 
 
 # === ROUTES: FULL ML PIPELINE ===
@@ -415,6 +428,7 @@ def ml_run(req: MLRequest, _: None = Depends(verify_api_key)) -> StandardRespons
     target_col = req.target_column
     if not target_col and req.use_llm_target_detection:
         schema = SchemaAnalyzer().execute(data=df)
+        _agent_ok_or_500("SchemaAnalyzer", schema)
         targ = TargetDetector().execute(
             data=df,
             column_info=schema.data.get("columns", []),
@@ -441,7 +455,5 @@ def ml_run(req: MLRequest, _: None = Depends(verify_api_key)) -> StandardRespons
         target_column=target_col,           # type: ignore[arg-type]
         problem_type=problem_type           # type: ignore[arg-type]
     )
-    if not res.is_success():
-        envelope_err(res.errors or ["ML pipeline failed"], 500)
-
-    return envelope_ok({"ml": res.data})
+    data = _agent_ok_or_500("MLOrchestrator", res)
+    return envelope_ok({"ml": data})

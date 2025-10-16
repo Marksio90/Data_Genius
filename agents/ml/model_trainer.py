@@ -1,7 +1,8 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO++++ - Model Trainer & Selector (KOSMOS)
+DataGenius PRO++++ - Model Trainer & Selector (KOSMOS, Enterprise)
 Trenuje i stroi modele ML z użyciem PyCaret (gdy dostępny) i wybiera rekomendowane algorytmy.
+
 Cechy PRO++++:
 - twarda walidacja wejść + sanity-checki targetu,
 - deterministyka (globalny seed), kontrola GPU, tryb cichy,
@@ -15,8 +16,8 @@ Cechy PRO++++:
 
 Kontrakt (AgentResult.data) — Trainer:
 {
-  "best_model": Any | None,                   # obiekt finalny PyCaret lub None (gdy brak PyCaret)
-  "model_path": str | None,                   # ścieżka bazowa bez rozszerzeń lub katalog
+  "best_model": Any | None,
+  "model_path": str | None,
   "artifacts": {
       "model_dir": str,
       "pipeline_path": str | None,
@@ -24,7 +25,7 @@ Kontrakt (AgentResult.data) — Trainer:
       "metadata_json": str | None
   },
   "pycaret_wrapper": PyCaretWrapper | None,
-  "models_comparison": List[Any],             # lista top modeli z compare; pusta, gdy brak
+  "models_comparison": List[Any],
   "primary_metric": str,
   "meta": {
       "problem_type": "classification"|"regression",
@@ -44,7 +45,7 @@ Kontrakt (AgentResult.data) — Trainer:
 
 Kontrakt (AgentResult.data) — Selector:
 {
-  "selected_models": Dict[str, Any],          # z config.model_registry
+  "selected_models": Dict[str, Any],
   "model_ids": List[str],
   "n_models": int,
   "meta": {
@@ -63,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -71,7 +73,7 @@ from agents.ml.pycaret_wrapper import PyCaretWrapper
 from config.settings import settings
 
 __all__ = ["TrainerConfig", "ModelTrainer", "ModelSelector"]
-__version__ = "4.2-kosmos"
+__version__ = "5.0-kosmos-enterprise"
 
 
 # === KONFIG — TRENOWANIE ===
@@ -94,6 +96,9 @@ class TrainerConfig:
     leaderboard_filename: str = "leaderboard.csv"
     metadata_filename: str = "metadata.json"
     pipeline_filename: str = "pipeline.pkl"         # może wskazywać na artefakt zapisu, gdy wrapper wspiera
+    # bezpieczeństwo i higiena
+    warn_extreme_imbalance_ratio: float = 10.0      # ostrzeż przy max/min > 10
+    max_feature_cols_warn: int = 5_000              # ostrzeżenie dla ekstremalnie szerokich tabel
 
 
 # === MODEL TRAINER ===
@@ -116,9 +121,7 @@ class ModelTrainer(BaseAgent):
         problem_type: Literal["classification", "regression"],
         **kwargs: Any
     ) -> AgentResult:
-        """
-        Uruchamia trening i strojenie, finalizuje i zapisuje artefakty.
-        """
+        """Uruchamia trening i strojenie, finalizuje i zapisuje artefakty."""
         result = AgentResult(agent_name=self.name)
         started_at_ts = time.time()
         warnings: List[str] = []
@@ -127,15 +130,33 @@ class ModelTrainer(BaseAgent):
             # --- Walidacja wejścia ---
             self._validate_inputs(data, target_column, problem_type)
 
-            # --- Konfiguracja podstawowa / meta ---
-            seed = int(getattr(settings, self.config.random_state_key, 42))
-            models_root = Path(getattr(settings, self.config.models_dir_env_key, "models"))
+            # --- Deterministyka (seed wewnętrzny; wrapper może mieć własny) ---
+            try:
+                seed = int(getattr(settings, self.config.random_state_key, 42))
+            except Exception:
+                seed = 42
+            try:
+                np.random.seed(seed)
+            except Exception:
+                pass
+
+            # --- Konfiguracja artefaktów / meta ---
+            try:
+                models_root = Path(getattr(settings, self.config.models_dir_env_key, "models"))
+            except Exception:
+                models_root = Path("models")
             models_root.mkdir(parents=True, exist_ok=True)
 
             primary_metric = (
                 self.config.primary_metric_cls if problem_type == "classification"
                 else self.config.primary_metric_reg
             )
+
+            n_rows, n_cols = int(len(data)), int(len(data.columns))
+
+            # ostrzeżenia higieniczne
+            if n_cols > self.config.max_feature_cols_warn:
+                warnings.append(f"Very wide dataset detected (n_cols={n_cols}). Consider feature selection.")
 
             # --- Decyzja o GPU ---
             use_gpu = self.config.use_gpu if self.config.use_gpu is not None else kwargs.pop("use_gpu", None)
@@ -153,10 +174,10 @@ class ModelTrainer(BaseAgent):
                 # Tryb degradacji — brak PyCaret, ale zwracamy spójny kontrakt
                 result.add_warning("PyCaret is unavailable. Training skipped (degraded mode).")
                 result.data = self._degraded_payload(
-                    n_rows=len(data), n_cols=len(data.columns),
+                    n_rows=n_rows, n_cols=n_cols,
                     problem_type=problem_type, target_column=target_column,
                     primary_metric=primary_metric, use_gpu=use_gpu,
-                    started_at_ts=started_at_ts, warnings=warnings
+                    started_at_ts=started_at_ts, warnings=warnings, seed=seed
                 )
                 return result
 
@@ -181,7 +202,8 @@ class ModelTrainer(BaseAgent):
                 include=self.config.compare_include,
                 exclude=self.config.compare_blacklist
             )
-            # normalize
+
+            # normalize list/singleton
             if isinstance(best_models, list):
                 models_list = best_models
                 best_model = best_models[0] if best_models else None
@@ -251,7 +273,7 @@ class ModelTrainer(BaseAgent):
                 "n_select": self.config.n_select,
                 "use_gpu": use_gpu,
                 "tuning": {"enabled": enable_tuning, "iterations": tuning_iters},
-                "n_rows": int(len(data)), "n_cols": int(len(data.columns)),
+                "n_rows": n_rows, "n_cols": n_cols,
                 "seed": seed,
                 "warnings": warnings,
             }
@@ -262,6 +284,7 @@ class ModelTrainer(BaseAgent):
                 warnings.append(f"Cannot write metadata.json: {e}")
 
             finished_at_ts = time.time()
+
             # krótki „brief” do logów
             if self.config.log_training_summary:
                 self._log_training_brief(pycaret, primary_metric)
@@ -285,8 +308,8 @@ class ModelTrainer(BaseAgent):
                     "fold": self.config.fold,
                     "use_gpu": use_gpu,
                     "tuning": {"enabled": enable_tuning, "iterations": tuning_iters},
-                    "n_rows": int(len(data)),
-                    "n_cols": int(len(data.columns)),
+                    "n_rows": n_rows,
+                    "n_cols": n_cols,
                     "seed": seed,
                     "started_at_ts": started_at_ts,
                     "finished_at_ts": finished_at_ts,
@@ -316,6 +339,7 @@ class ModelTrainer(BaseAgent):
         if problem_type not in {"classification", "regression"}:
             raise ValueError(f"Unsupported problem_type='{problem_type}'")
 
+        # target sanity
         y = df[target_column]
         if y.isna().all():
             raise ValueError("All target values are NaN — cannot train.")
@@ -324,8 +348,14 @@ class ModelTrainer(BaseAgent):
             if nunique < 2:
                 raise ValueError(f"Classification requires ≥2 classes; found {nunique}.")
             vc = y.value_counts(dropna=True)
-            if len(vc) > 1 and (vc.max() / max(1, vc.min())) > 10:
-                self.logger.warning("Severe class imbalance detected (max/min > 10). Consider resampling/weights.")
+            try:
+                if len(vc) > 1 and (vc.max() / max(1, vc.min())) > self.config.warn_extreme_imbalance_ratio:
+                    self.logger.warning(
+                        f"Severe class imbalance detected (max/min > {self.config.warn_extreme_imbalance_ratio}). "
+                        "Consider resampling/weights."
+                    )
+            except Exception:
+                pass
 
     # === LOGI PODSUMOWANIA ===
     def _log_training_brief(self, pycaret: PyCaretWrapper, primary_metric: str) -> None:
@@ -354,7 +384,8 @@ class ModelTrainer(BaseAgent):
         primary_metric: str,
         use_gpu: Optional[bool],
         started_at_ts: float,
-        warnings: List[str]
+        warnings: List[str],
+        seed: int
     ) -> Dict[str, Any]:
         finished_at_ts = time.time()
         return {
@@ -377,7 +408,7 @@ class ModelTrainer(BaseAgent):
                 "tuning": {"enabled": False, "iterations": None},
                 "n_rows": int(n_rows),
                 "n_cols": int(n_cols),
-                "seed": int(getattr(settings, self.config.random_state_key, 42)),
+                "seed": int(seed),
                 "started_at_ts": started_at_ts,
                 "finished_at_ts": finished_at_ts,
                 "elapsed_s": round(finished_at_ts - started_at_ts, 4),

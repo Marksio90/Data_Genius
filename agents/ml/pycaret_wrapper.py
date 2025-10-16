@@ -1,8 +1,9 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO++++ — PyCaret Wrapper (KOSMOS)
+DataGenius PRO++++ — PyCaret Wrapper (KOSMOS, Enterprise)
 Ujednolicony, defensywny wrapper nad PyCaret (classification/regression) z czystym,
 stabilnym API: setup → compare → tune → finalize/save → predict (+ pull/leaderboard).
+
 PRO++++:
 - Lazy-import + twarde komunikaty, wykrywanie wersji PyCaret.
 - Stabilny kontrakt metod, defensywne walidacje i czytelne błędy.
@@ -57,7 +58,7 @@ class PyCaretWrapper:
                get_pipeline_path(), save_session_artifacts()
     """
 
-    version: str = "4.2-kosmos"
+    version: str = "5.0-kosmos-enterprise"
 
     def __init__(self, problem_type: Literal["classification", "regression"], config: Optional[PyCaretConfig] = None):
         self.problem_type = problem_type
@@ -83,7 +84,7 @@ class PyCaretWrapper:
         self._tune_model = pc.tune_model
         self._finalize_model = pc.finalize_model
         self._predict_model = pc.predict_model
-        self._plot_model = pc.plot_model
+        self._plot_model = getattr(pc, "plot_model", None)
         self._save_model = pc.save_model
         self._load_model = pc.load_model
 
@@ -363,7 +364,8 @@ class PyCaretWrapper:
         try:
             # Spróbuj wygenerować wykres FI (najczęściej zapisuje PNG w bieżącym katalogu)
             try:
-                self._plot_model(model, plot="feature", save=True)
+                if self._plot_model is not None:
+                    self._plot_model(model, plot="feature", save=True)
             except Exception:
                 pass
 
@@ -404,11 +406,9 @@ class PyCaretWrapper:
         if self.problem_type != "classification" or self._get_config is None:
             return None
         try:
-            le = self._get_config("prep_pipe")  # w pipeline bywa LabelEncoder/OrdinalEncoder
-            # Bez rozpakowywania szczegółów — często wystarcza get_config('y_train')
+            # Najbardziej przenośne: patrz na y_train jako categoricals
             y_train = self._get_config("y_train")
             if isinstance(y_train, pd.Series) and hasattr(y_train, "cat"):
-                # Pandas categorical
                 cats = list(y_train.cat.categories)
                 return {i: v for i, v in enumerate(cats)}
         except Exception:
@@ -420,7 +420,6 @@ class PyCaretWrapper:
         Heurystyka ścieżki pipeline’u (jeżeli wrapper/środowisko zapisuje go osobno).
         W PyCaret zazwyczaj cały pipeline jest w modelu .pkl — zwracamy None.
         """
-        # Pozostawiamy None — ModelTrainer traktuje to defensywnie.
         return None
 
     def save_session_artifacts(self, out_dir: Path) -> Dict[str, Optional[str]]:
