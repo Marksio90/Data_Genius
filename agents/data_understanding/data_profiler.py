@@ -18,11 +18,11 @@ Wyjściowy kontrakt (dict):
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Any, Optional, Tuple, Literal, Callable, Iterable
-from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple, Literal, Callable
 import time
 import hashlib
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -113,13 +113,18 @@ def _truncate(obj: Any, limit: int = 400) -> str:
     return s if len(s) <= limit else s[:limit] + f"...(+{len(s)-limit} chars)"
 
 
+def _is_object_dtype(s: pd.Series) -> bool:
+    """True dla pandas 'object' lub 'string' dtypes."""
+    return s.dtype == "object" or s.dtype.name == "string"
+
+
 def _coerce_object_datetime_like(s: pd.Series, parse_ratio: float) -> Tuple[pd.Series, bool]:
     """
-    Heurystycznie sprawdza, czy kolumna object jest „datopodobna”.
+    Heurystycznie sprawdza, czy kolumna object/string jest „datopodobna”.
     Jeśli > parse_ratio wartości parsowalne do datetime → zwraca skopiowaną, sparsowaną serię i True.
     W przeciwnym razie zwraca oryginał i False. Zero side-effectów na oryginalnym df.
     """
-    if s.dtype != "object":
+    if not _is_object_dtype(s):
         return s, False
     try:
         sample = s.dropna().astype(str)
@@ -128,7 +133,6 @@ def _coerce_object_datetime_like(s: pd.Series, parse_ratio: float) -> Tuple[pd.S
         parsed = pd.to_datetime(sample, errors="coerce", utc=False)
         ratio = float(parsed.notna().mean())
         if ratio >= parse_ratio:
-            # parsujemy całą kolumnę na kopii
             parsed_full = pd.to_datetime(s.astype(str), errors="coerce", utc=False)
             return parsed_full, True
         return s, False
@@ -152,9 +156,17 @@ class DataProfiler(BaseAgent):
             name="DataProfiler",
             description="Comprehensive data profiling and quality assessment"
         )
+        warnings.filterwarnings("ignore")
         self.config = config or ProfilerConfig()
-        self.validator = DataValidator()
-        self._log = logger.bind(agent="DataProfiler")
+        # DataValidator może rzucić wyjątkiem — opakowujemy konstrukcję w guard
+        try:
+            self.validator = DataValidator()
+        except Exception as e:
+            logger.warning(f"DataValidator unavailable, running in degraded mode. Reason: {e}")
+            class _NullValidator:
+                def get_data_quality_score(self, *_args, **_kwargs):
+                    return 0.0, {"error": "validator_unavailable"}
+            self.validator = _NullValidator()
 
     # === NAZWA_SEKCJI === WALIDACJA WEJŚCIA ===
     def validate_input(self, **kwargs) -> bool:
@@ -183,15 +195,19 @@ class DataProfiler(BaseAgent):
         """
         result = AgentResult(agent_name=self.name)
         try:
-            if data is None or data.empty:
-                self._log.warning("received empty DataFrame.")
+            if data is None or not isinstance(data, pd.DataFrame) or data.empty:
+                logger.warning("DataProfiler: received empty or invalid DataFrame.")
                 result.data = self._empty_payload()
                 return result
 
-            # 1) Quality (delegacja do DataValidator)
             t0 = time.perf_counter()
-            quality_score, quality_details = self.validator.get_data_quality_score(data)
-            self._log.info(f"quality_score: {quality_score:.2f} (via DataValidator)")
+
+            # 1) Quality (delegacja do DataValidator) — defensywnie
+            try:
+                quality_score, quality_details = self.validator.get_data_quality_score(data)
+            except Exception as e:
+                logger.warning(f"DataValidator failed: {e}")
+                quality_score, quality_details = 0.0, {"error": "validator_failed", "message": str(e)}
 
             # 2) Statistical profile
             statistical_profile = self._get_statistical_profile(data)
@@ -215,11 +231,11 @@ class DataProfiler(BaseAgent):
             }
 
             dt = (time.perf_counter() - t0) * 1000
-            self._log.success(f"profiling complete in {dt:.1f} ms, quality={quality_score:.1f}/100")
+            logger.success(f"DataProfiler: profiling complete in {dt:.1f} ms, quality={quality_score:.1f}/100")
 
         except Exception as e:
             result.add_error(f"Data profiling failed: {e}")
-            self._log.exception(f"Data profiling error: {e}")
+            logger.exception(f"Data profiling error: {e}")
 
         return result
 
@@ -232,16 +248,16 @@ class DataProfiler(BaseAgent):
 
         # Dtypes
         num_cols = df.select_dtypes(include=[np.number]).columns
-        cat_cols = df.select_dtypes(include=["object", "category"]).columns
+        cat_cols = df.select_dtypes(include=["object", "category", "string"]).columns
 
-        # Heurystyczna detekcja dat w object (na kopiach serii — bez modyfikacji df)
+        # Heurystyczna detekcja dat w object/string (na kopiach serii — bez modyfikacji df)
         dt_like_cols: List[str] = []
         for col in df.columns:
             s = df[col]
             if pd.api.types.is_datetime64_any_dtype(s):
                 dt_like_cols.append(str(col))
                 continue
-            if s.dtype == "object":
+            if _is_object_dtype(s):
                 _, is_dt = _coerce_object_datetime_like(s, self.config.object_datetime_parse_ratio)
                 if is_dt:
                     dt_like_cols.append(str(col))
@@ -263,7 +279,7 @@ class DataProfiler(BaseAgent):
         cols_with_missing = df.isna().sum()
         cols_with_missing = cols_with_missing[cols_with_missing > 0].astype(int).to_dict()
 
-        # Dtypes (per column) do czytelnego raportu
+        # Dtypes (per column)
         dtypes_map = {str(c): str(t) for c, t in df.dtypes.items()}
 
         meta: Dict[str, Any] = {}
@@ -339,8 +355,8 @@ class DataProfiler(BaseAgent):
                 except Exception:
                     pass
 
-        # Wysoka kardynalność (object/category)
-        for col in df.select_dtypes(include=["object", "category"]).columns:
+        # Wysoka kardynalność (object/category/string)
+        for col in df.select_dtypes(include=["object", "category", "string"]).columns:
             try:
                 n_unique = int(df[col].nunique(dropna=True))
             except Exception:
@@ -400,14 +416,23 @@ class DataProfiler(BaseAgent):
                     "n_outliers": n_outliers,
                 })
 
-        # Mixed-type detection (dla object) — np. liczby i teksty w jednej kolumnie
+        # Mixed-type detection (dla object/string) — np. liczby i teksty w jednej kolumnie
         if self.config.enable_mixed_type_check:
-            for col in df.select_dtypes(include=["object"]).columns:
+            for col in df.select_dtypes(include=["object", "string"]).columns:
                 s = df[col].dropna()
                 if s.empty:
                     continue
-                # heurystyka: obecność przynajmniej dwóch „rodzin” typów po rzutowaniu
-                has_numeric_like = s.map(lambda x: isinstance(x, (int, float)) or (isinstance(x, str) and x.replace('.', '', 1).isdigit())).any()
+                def _is_numeric_like(x: Any) -> bool:
+                    if isinstance(x, (int, float, np.integer, np.floating)):
+                        return True
+                    if isinstance(x, str):
+                        try:
+                            float(x.replace(",", "."))
+                            return True
+                        except Exception:
+                            return False
+                    return False
+                has_numeric_like = s.map(_is_numeric_like).any()
                 has_alpha_like = s.map(lambda x: isinstance(x, str) and any(c.isalpha() for c in x)).any()
                 if has_numeric_like and has_alpha_like:
                     issues.append({
@@ -418,7 +443,7 @@ class DataProfiler(BaseAgent):
                     })
 
         # Tekst ciężki (średnia długość wysoka)
-        for col in df.select_dtypes(include=["object"]).columns:
+        for col in df.select_dtypes(include=["object", "string"]).columns:
             s = df[col].dropna().astype(str)
             if s.empty:
                 continue
@@ -432,12 +457,12 @@ class DataProfiler(BaseAgent):
                     "avg_len": avg_len,
                 })
 
-        # Datetime monotonicity (częste w szeregach czasowych; wykrywa też object→datetime heurystycznie)
+        # Datetime monotonicity (series)
         for col in df.columns:
             s = df[col]
             if pd.api.types.is_datetime64_any_dtype(s):
                 sdt = s.dropna()
-            elif s.dtype == "object":
+            elif _is_object_dtype(s):
                 coerced, is_dt = _coerce_object_datetime_like(s, self.config.object_datetime_parse_ratio)
                 if not is_dt:
                     continue
@@ -476,12 +501,12 @@ class DataProfiler(BaseAgent):
         for col in df.columns:
             s = df[col]
 
-            # Typ (uwzględnij object→datetime heurystycznie)
+            # Typ (uwzględnij object/string → datetime heurystycznie)
             if pd.api.types.is_numeric_dtype(s):
                 ch["numeric"].append(str(col))
             elif pd.api.types.is_datetime64_any_dtype(s):
                 ch["datetime"].append(str(col))
-            elif s.dtype == "object":
+            elif _is_object_dtype(s):
                 _, is_dt = _coerce_object_datetime_like(s, self.config.object_datetime_parse_ratio)
                 if is_dt:
                     ch["datetime"].append(str(col))
@@ -524,7 +549,7 @@ class DataProfiler(BaseAgent):
                 ch["id_like"].append(str(col))
 
             # text_heavy
-            if s.dtype == "object":
+            if _is_object_dtype(s):
                 ss = s.dropna().astype(str)
                 if not ss.empty and float(ss.str.len().mean()) >= cfg.text_heavy_avg_len:
                     ch["text_heavy"].append(str(col))
@@ -549,12 +574,12 @@ class DataProfiler(BaseAgent):
         if k < 2:
             return {"n_numeric_features": k, "correlation_matrix": None, "high_correlations": [], "n_high_correlations": 0}
 
-        # Soft limit kolumn (dla bardzo szerokich tabel)
+        # Soft limit kolumn
         num_cols = num_cols_all[: cfg.max_corr_cols] if k > cfg.max_corr_cols else num_cols_all
         if k > cfg.max_corr_cols:
-            self._log.warning(f"correlations: limiting numeric columns from {k} to {len(num_cols)} for performance.")
+            logger.warning(f"correlations: limiting numeric columns from {k} to {len(num_cols)} for performance.")
 
-        # Sampling safety dla bardzo dużych danych
+        # Sampling safety
         if len(df) > cfg.max_corr_rows:
             df_corr = df[num_cols].sample(n=cfg.max_corr_rows, random_state=42).copy()
         else:
@@ -568,14 +593,13 @@ class DataProfiler(BaseAgent):
         if df_corr.empty or len(df_corr.columns) < 2:
             return {"n_numeric_features": len(num_cols), "correlation_matrix": None, "high_correlations": [], "n_high_correlations": 0}
 
-        # Higiena inf/NaN: do obliczeń korelacji zastępujemy +/-inf → NaN, potem pairwise/dropping
+        # Higiena inf/NaN
         df_corr = df_corr.replace([np.inf, -np.inf], np.nan)
 
         # Obliczanie korelacji
         try:
             corr_matrix = df_corr.corr(method=cfg.corr_method, numeric_only=True)
         except Exception:
-            # awaryjnie: pearson
             corr_matrix = df_corr.corr(method="pearson", numeric_only=True)
 
         if cfg.corr_nan_policy == "drop":

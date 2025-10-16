@@ -59,18 +59,23 @@ class TargetDetectorConfig:
     # Heurystyki
     heuristic_default_confidence: float = 0.70
     heuristic_fallback_confidence: float = 0.55
-    # słowa-klucze sugerujące target
+    # słowa-klucze sugerujące target (PL/EN rozszerzone)
     target_keywords: Tuple[str, ...] = (
-        "target","label","class","outcome","result",
-        "price","sales","revenue","churn","fraud",
-        "risk","score","rating","survived","default",
-        "y","y_true","y_label","response","conversion","converted","clicked","amount","charge","loss"
+        # EN
+        "target","label","class","outcome","result","response","score","rating",
+        "price","sales","revenue","profit","margin","churn","fraud","risk","survived",
+        "default","y","y_true","y_label","conversion","converted","clicked","amount","charge","loss",
+        # PL
+        "cel","etykieta","klasa","wynik","odpowiedz","ocena","skoring","cena","sprzedaz",
+        "przychod","zysk","marza","rezygnacja","oszustwo","ryzyko","przezycie","domysl","klik","konwersja"
     )
     # semantyki i nazwy, których nie wybieramy jako target
     forbidden_semantics: Tuple[str, ...] = (
-        "id","uuid","guid","timestamp","datetime","text","free_text","identifier","hash","key"
+        "id","uuid","guid","timestamp","datetime","text","free_text","identifier","hash","key","description","comment"
     )
-    forbidden_name_substrings: Tuple[str, ...] = ("id","uuid","guid","ts","time","stamp","hash","key")
+    forbidden_name_substrings: Tuple[str, ...] = (
+        "id","uuid","guid","ts","time","stamp","hash","key","_id","session","token","checksum"
+    )
     # wagi rankingu heurystycznego
     w_name_keyword: float = 0.40
     w_semantic: float = 0.20
@@ -81,6 +86,7 @@ class TargetDetectorConfig:
     # progi/definicje pomocnicze
     id_like_unique_ratio: float = 0.98        # ~98%+ unikalnych → ID-like (kara)
     high_missing_ratio_flag: float = 0.30     # >30% braków → kara
+    quasi_constant_ratio: float = 0.995       # kara za quasi-stałe
     truncate_log_chars: int = 500             # cięcie długich struktur w logach
     # inne
     treat_inf_as_na: bool = True              # ±Inf → NaN przed analizą
@@ -334,7 +340,7 @@ class TargetDetector(BaseAgent):
             if col is not None:
                 return col, conf, reason, (k + 1)
 
-            last_reason, last_conf, last_col = reason, conf, col  # meta do dziennika
+            last_reason, last_conf, last_col = reason, conf, col
             if k < attempts - 1:
                 sleep_s = min(remaining, self.config.llm_retry_backoff_base * (2 ** k))
                 if sleep_s > 0:
@@ -463,7 +469,8 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
           * dtype (bonus: numeric/object; kara: datetimes),
           * braki (kara za > high_missing_ratio_flag),
           * unikatowość (kara za ID-like),
-          * pozycja (lekki bonus dla ostatniej kolumny).
+          * pozycja (lekki bonus dla ostatniej kolumny),
+          * quasi-constant/constant (kara).
         Zwraca (nazwa, score 0..1) lub None.
         """
         if not column_info:
@@ -474,6 +481,9 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
 
         cfg = self.config
         candidates: List[Tuple[str, float, Dict[str, Any]]] = []
+
+        # pomocnicze mapy dla szybkiego dostępu
+        info_by_name: Dict[str, Dict[str, Any]] = {str(ci.get("name", "")): ci for ci in column_info}
 
         for idx, col in enumerate(column_info):
             name = str(col.get("name", ""))
@@ -487,6 +497,25 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
             n = max(1, len(df))
             unique_ratio = (nuni / n)
 
+            # 0) Constant/quasi-constant (na bazie column_info lub fallbackowo)
+            const_penalty = 0.0
+            try:
+                extras = col.get("extras", {})
+                is_quasi = bool(extras.get("quasi_constant", False))
+                # fallback: jeśli top wartość > quasi_constant_ratio
+                if not is_quasi and "top_values" in extras and isinstance(extras["top_values"], dict) and n > 0:
+                    tv = extras["top_values"]
+                    if len(tv):
+                        top_freq = max(int(v) for v in tv.values())
+                        if (top_freq / max(1, len(df[name].dropna()))) >= cfg.quasi_constant_ratio:
+                            is_quasi = True
+                if is_quasi:
+                    const_penalty = 0.5
+                if nuni <= 1:
+                    const_penalty = max(const_penalty, 0.7)
+            except Exception:
+                pass
+
             # 1) Nazwa — słowa-klucze / forbidden substrings
             lname = name.lower()
             name_score = 1.0 if any(k in lname for k in cfg.target_keywords) else 0.0
@@ -498,7 +527,7 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
             if self._is_forbidden_semantics(sem):
                 sem_score = 0.0
             else:
-                if any(x in sem for x in ("outcome","result","score","rating","target","label","class","y")):
+                if any(x in sem for x in ("outcome","result","score","rating","target","label","class","y","cel","etykieta","klasa","wynik")):
                     sem_score = 1.0
                 else:
                     sem_score = 0.5
@@ -520,6 +549,9 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
             # 6) Pozycja — lekki bonus dla ostatniej kolumny
             position_bonus = 1.0 if name == df.columns[-1] else 0.0
 
+            # Dodatkowa kara za quasi/constant
+            const_penalty_weighted = const_penalty * 0.5  # nie zabija kandydata, ale obniża
+
             # Składanie wyniku 0..1
             raw = (
                 cfg.w_name_keyword * name_score +
@@ -527,13 +559,13 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
                 cfg.w_dtype * dtype_score +
                 cfg.w_position_hint * position_bonus
             )
-            penalty = (cfg.w_missing * missing_penalty) + (cfg.w_uniqueness * unique_penalty)
+            penalty = (cfg.w_missing * missing_penalty) + (cfg.w_uniqueness * unique_penalty) + const_penalty_weighted
             score = max(0.0, min(1.0, raw - penalty))
 
             candidates.append((name, score, {
                 "name_score": name_score, "sem_score": sem_score, "dtype_score": dtype_score,
                 "missing_penalty": missing_penalty, "unique_penalty": unique_penalty,
-                "position_bonus": position_bonus
+                "position_bonus": position_bonus, "const_penalty": const_penalty_weighted
             }))
 
         if not candidates:
@@ -572,9 +604,16 @@ FORMAT ODPOWIEDZI — 100% poprawny JSON, bez dodatkowego tekstu:
                 })
         else:
             vc = target.dropna().value_counts()
+            maj = None
+            maj_pct = 0.0
+            if not vc.empty:
+                maj = str(vc.index[0])
+                maj_pct = float(vc.iloc[0] / max(1, int(vc.sum())) * 100.0)
             info.update({
                 "value_distribution": {str(k): int(v) for k, v in vc.head(10).to_dict().items()},
                 "n_classes": int(vc.shape[0]),
+                "majority_class": maj,
+                "majority_class_pct": maj_pct,
             })
         return info
 

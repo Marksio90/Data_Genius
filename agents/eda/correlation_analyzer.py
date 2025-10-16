@@ -1,8 +1,11 @@
 # === OPIS MODUŁU ===
 """
-DataGenius PRO - Correlation Analyzer (PRO++++++++++)
+DataGenius PRO++++++++++++ — Correlation Analyzer (Enterprise / KOSMOS)
 Analiza zależności między cechami (numeryczne i kategoryczne) oraz względem targetu
-z defensywną walidacją, samplingiem i zaawansowanymi miarami (Cramér's V z korekcją, η², opcj. Theil's U).
+z defensywną walidacją, samplingiem i zaawansowanymi miarami:
+- num↔num: Pearson / Spearman oraz tryb hybrydowy (max |r|)
+- cat↔cat: chi² + Cramér's V (z korekcją stronniczości), opcjonalnie Theil's U
+- num/cat ↔ target: point-biserial / Spearman (kody), η², Cramér's V
 
 Kontrakt (AgentResult.data):
 {
@@ -36,11 +39,13 @@ Kontrakt (AgentResult.data):
 }
 """
 
-# === IMPORTY ===
 from __future__ import annotations
 
+# === NAZWA_SEKCJI === IMPORTY ===
+import threading
+import warnings
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -53,104 +58,193 @@ from core.base_agent import BaseAgent, AgentResult
 # === NAZWA_SEKCJI === KONFIG / PROGI ===
 @dataclass(frozen=True)
 class CorrConfig:
+    """Ustawienia analizy korelacji (skalowalność, metody, progi)."""
     # — główne —
-    high_corr_threshold: float = 0.80          # próg silnej korelacji |r|
-    alpha: float = 0.05                        # poziom istotności dla testów chi2
-    max_rows_for_corr: int = 200_000           # sampling safety (wiersze)
-    max_corr_cols: int = 300                   # miękki limit kolumn numerycznych (O(k^2))
+    high_corr_threshold: float = 0.80            # próg silnej korelacji |r|
+    alpha: float = 0.05                          # poziom istotności dla testów chi2
+    max_rows_for_corr: int = 200_000             # sampling safety (wiersze)
+    max_corr_cols: int = 300                     # miękki limit kolumn numerycznych (O(k^2))
+    random_state: int = 42                       # reproducibility
+
     # — metody —
-    compute_spearman: bool = True              # licz równolegle macierz Spearmana
-    hybrid_choose_maxabs: bool = True          # wybierz per-para |r| max(Pearson, Spearman)
+    compute_spearman: bool = True                # licz równolegle macierz Spearmana
+    hybrid_choose_maxabs: bool = True            # wybierz per-para |r| max(Pearson, Spearman)
+
     # — chi2 / kategorie —
     min_expected_count_chi2: float = 1.0
     min_cells_with_expected_5: int = 0
-    cat_max_levels: int = 200                  # maks poziomów (Top-K) do crosstab
-    compute_theils_u: bool = False             # opcjonalnie licz Theil's U dla kat-kat
+    cat_max_levels: int = 200                    # maks. poziomów (Top-K) do crosstab
+    compute_theils_u: bool = False               # opcjonalnie licz Theil’s U dla kat-kat
+
     # — target —
     top_k_target_features: int = 5
+
     # — inne —
-    use_pairwise_nan: bool = True              # pairwise przy licz. macierzy (pandas.corr)
-    round_decimals: int = 6                    # zaokrąglanie wyników
+    use_pairwise_nan: bool = True                # pairwise przy licz. macierzy (pandas.corr)
+    round_decimals: int = 6                      # zaokrąglanie wyników
+
+    # — cache (opcjonalny, lock-safe) —
+    cache_enabled: bool = True
+    cache_ttl_s: int = 120
+    cache_maxsize: int = 128
+
+
+# === NAZWA_SEKCJI === CACHE TTL (LOCK-SAFE) ===
+class _TTLCache:
+    """Prosty cache TTL dla payloadów — klucz: fingerprint danych + parametry."""
+    def __init__(self, maxsize: int, ttl_s: int) -> None:
+        self.maxsize = maxsize
+        self.ttl_s = ttl_s
+        self._store: Dict[str, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        import time
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            ts, val = item
+            if (time.time() - ts) > self.ttl_s:
+                self._store.pop(key, None)
+                return None
+            return val
+
+    def set(self, key: str, value: Any) -> None:
+        import time
+        with self._lock:
+            if len(self._store) >= self.maxsize:
+                oldest_key = min(self._store.items(), key=lambda kv: kv[1][0])[0]
+                self._store.pop(oldest_key, None)
+            self._store[key] = (time.time(), value)
 
 
 # === NAZWA_SEKCJI === KLASA GŁÓWNA ===
 class CorrelationAnalyzer(BaseAgent):
     """
-    Analyzes correlations between features (numeric & categorical) oraz względem targetu.
-    Defensywna, skalowalna i konfigurowalna implementacja PRO++++++++++.
+    Enterprise-grade analiza korelacji i asocjacji cech:
+    - num↔num: Pearson, Spearman, hybryda max|r|
+    - cat↔cat: chi² + Cramér’s V (korekcja stronniczości), opcj. Theil’s U
+    - cechy ↔ target: point-biserial / Spearman(kody) / η² / Cramér’s V
+
+    Defensywnie zabezpieczona (sampling, limity kolumn, clipping, wyjątki),
+    z opcjonalnym cache TTL i spójnym kontraktem wyników.
     """
 
     def __init__(self, config: Optional[CorrConfig] = None) -> None:
         super().__init__(name="CorrelationAnalyzer", description="Analyzes feature correlations")
         self.config = config or CorrConfig()
+        self._cache = _TTLCache(self.config.cache_maxsize, self.config.cache_ttl_s)
+        warnings.filterwarnings("ignore")
 
-    # === NAZWA_SEKCJI === GŁÓWNE WYKONANIE ===
+    # === NAZWA_SEKCJI === WYKONANIE GŁÓWNE ===
     def execute(
         self,
         data: pd.DataFrame,
         target_column: Optional[str] = None,
         **kwargs: Any
     ) -> AgentResult:
-        """Analyze correlations with robust guards and performance caps."""
+        """
+        Analizuje korelacje i asocjacje cech + zależności względem targetu.
+
+        Args:
+            data: Dane wejściowe (pandas DataFrame)
+            target_column: opcjonalna nazwa kolumny celu
+
+        Returns:
+            AgentResult z payloadem zgodnym z kontraktem (patrz docstring modułu).
+        """
         result = AgentResult(agent_name=self.name)
 
         try:
+            # --- Walidacja i sanity ---
             if data is None or not isinstance(data, pd.DataFrame) or data.empty:
                 msg = "Empty or invalid DataFrame — skipping correlation analysis."
                 result.add_warning(msg)
                 result.data = self._empty_payload(msg)
                 return result
 
-            df_corr = self._maybe_sample(data)
+            df = data.copy(deep=False)
+            # Inf → NaN (bezpieczniej dla korelacji)
+            try:
+                df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            except Exception:
+                pass
 
-            # 1) Numeric correlations
+            # --- Cache fingerprint (opcjonalny) ---
+            payload_from_cache: Optional[Dict[str, Any]] = None
+            cache_key = None
+            if self.config.cache_enabled:
+                cache_key = self._make_cache_key(df, target_column)
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    self.logger.info("CorrelationAnalyzer: cache HIT")
+                    result.data = cached
+                    return result
+                self.logger.debug("CorrelationAnalyzer: cache MISS")
+
+            # --- Sampling ---
+            df_corr = self._maybe_sample(df)
+
+            # 1) Korelacje numeryczne
             numeric_corr = self._analyze_numeric_correlations(df_corr)
 
-            # 2) Categorical associations
+            # 2) Asocjacje kategoryczne
             categorical_assoc = self._analyze_categorical_associations(df_corr)
 
-            # 3) Feature–target
+            # 3) Zależności cechy ↔ target
             target_corr = None
-            if isinstance(target_column, str) and target_column in data.columns:
-                target_corr = self._analyze_target_correlations(data, target_column)
+            if isinstance(target_column, str) and target_column in df.columns:
+                target_corr = self._analyze_target_correlations(df, target_column)
 
-            # 4) Highly correlated pairs
-            high_corr = self._identify_high_correlations(numeric_corr, threshold=self.config.high_corr_threshold)
+            # 4) Pary o wysokiej korelacji
+            high_corr = self._identify_high_correlations(
+                numeric_corr, threshold=self.config.high_corr_threshold
+            )
 
-            # 5) Recommendations
+            # 5) Rekomendacje
             recommendations = self._get_recommendations(high_corr, target_corr)
 
-            result.data = {
+            payload = {
                 "numeric_correlations": numeric_corr,
                 "categorical_associations": categorical_assoc,
                 "target_correlations": target_corr,
                 "high_correlations": high_corr,
                 "recommendations": recommendations,
             }
-            logger.success("Correlation analysis complete")
+
+            # --- Cache set (opcjonalnie) ---
+            if self.config.cache_enabled and cache_key:
+                try:
+                    self._cache.set(cache_key, payload)
+                except Exception:
+                    pass
+
+            result.data = payload
+            self.logger.success("Correlation analysis complete")
+            return result
 
         except Exception as e:
             result.add_error(f"Correlation analysis failed: {e}")
-            logger.exception(f"Correlation analysis error: {e}")
+            self.logger.exception(f"Correlation analysis error: {e}")
+            return result
 
-        return result
-
-    # === NAZWA_SEKCJI === SAMPLING ===
+    # === NAZWA_SEKCJI === SAMPLING / LIMITY ===
     def _maybe_sample(self, df: pd.DataFrame) -> pd.DataFrame:
         """Zwraca próbkę df dla obliczeń korelacji, jeśli danych jest bardzo dużo."""
         try:
             if len(df) > self.config.max_rows_for_corr:
-                logger.info(f"Sampling for correlations: {len(df)} → {self.config.max_rows_for_corr} rows")
-                return df.sample(n=self.config.max_rows_for_corr, random_state=42)
-        except Exception:
-            pass
+                self.logger.info(f"Sampling for correlations: {len(df)} → {self.config.max_rows_for_corr} rows")
+                return df.sample(n=self.config.max_rows_for_corr, random_state=self.config.random_state)
+        except Exception as e:
+            self.logger.debug(f"Sampling skipped (reason: {e})")
         return df
 
-    # === NAZWA_SEKCJI === KORELACJE NUMERYCZNE ===
+    # === NAZWA_SEKCJI === KORELACJE NUMERICZNE ===
     def _analyze_numeric_correlations(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
-        Analyze correlations between numeric features.
-        Zwraca macierz 'hybrydową' jeśli włączono hybrid_choose_maxabs (max |r| z Pearson/Spearman).
+        Korelacje między cechami numerycznymi.
+        W trybie hybrydowym per-para wybieramy większą wartość |r| (Pearson vs Spearman).
         """
         cfg = self.config
         num_cols_all = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -164,14 +258,16 @@ class CorrelationAnalyzer(BaseAgent):
                 "spearman_matrix": None,
             }
 
-        # soft limit kolumn
+        # Limit liczby kolumn (O(k^2))
         num_cols = num_cols_all[: cfg.max_corr_cols] if len(num_cols_all) > cfg.max_corr_cols else num_cols_all
         if len(num_cols_all) > cfg.max_corr_cols:
-            logger.warning(f"Limiting numeric columns from {len(num_cols_all)} to {len(num_cols)} for performance.")
+            self.logger.warning(
+                f"Limiting numeric columns from {len(num_cols_all)} to {len(num_cols)} for performance."
+            )
 
         df_num = df[num_cols].copy()
 
-        # Pairwise polityka braków – pandas.corr stosuje pairwise dla pearson/spearman
+        # Pandas.corr → pairwise NaN handling (spójne z cfg.use_pairwise_nan)
         pearson_m = df_num.corr(method="pearson", numeric_only=True)
         spearman_m = None
         selected_m = pearson_m
@@ -180,11 +276,11 @@ class CorrelationAnalyzer(BaseAgent):
         if cfg.compute_spearman:
             try:
                 spearman_m = df_num.corr(method="spearman", numeric_only=True)
-            except Exception:
+            except Exception as e:
+                self.logger.debug(f"Spearman matrix failed: {e}")
                 spearman_m = None
             if spearman_m is not None:
                 if cfg.hybrid_choose_maxabs:
-                    # per-para wybór większego |r|
                     p = pearson_m.copy()
                     s = spearman_m.copy()
                     sel = p.abs().fillna(0.0) >= s.abs().fillna(0.0)
@@ -194,11 +290,10 @@ class CorrelationAnalyzer(BaseAgent):
                     selected_m = spearman_m
                     final_method = "spearman"
 
-        # clipping i rounding do stabilności numerycznej
         def _sanitize(dfm: Optional[pd.DataFrame]) -> Optional[Dict[str, Dict[str, float]]]:
             if dfm is None:
                 return None
-            out = dfm.clip(lower=-1.0, upper=1.0).round(cfg.round_decimals)
+            out = dfm.clip(lower=-1.0, upper=1.0).round(cfg.round_decimals).fillna(0.0)
             return out.to_dict()
 
         return {
@@ -207,12 +302,12 @@ class CorrelationAnalyzer(BaseAgent):
             "features": num_cols,
             "correlation_matrix": _sanitize(selected_m),
             "pearson_matrix": _sanitize(pearson_m) if cfg.compute_spearman else None,
-            "spearman_matrix": _sanitize(spearman_m) if cfg.compute_spearman and spearman_m is not None else None,
+            "spearman_matrix": _sanitize(spearman_m) if (cfg.compute_spearman and spearman_m is not None) else None,
         }
 
     # === NAZWA_SEKCJI === KATEGORIA↔KATEGORIA (chi² + Cramér’s V + opcj. Theil’s U) ===
     def _analyze_categorical_associations(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Analyze associations between categorical features."""
+        """Asocjacje między cechami kategorycznymi (chi², Cramér’s V z korekcją, opcj. Theil’s U)."""
         cfg = self.config
         cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
         if len(cat_cols) < 2:
@@ -222,7 +317,6 @@ class CorrelationAnalyzer(BaseAgent):
         for i, c1 in enumerate(cat_cols):
             for c2 in cat_cols[i + 1:]:
                 try:
-                    # Top-K poziomów by nie tworzyć gigantycznej tabeli
                     s1 = self._cap_categories(df[c1], cfg.cat_max_levels)
                     s2 = self._cap_categories(df[c2], cfg.cat_max_levels)
                     contingency = pd.crosstab(s1, s2)
@@ -264,7 +358,7 @@ class CorrelationAnalyzer(BaseAgent):
 
                     associations.append(record)
                 except Exception as e:
-                    logger.warning(f"Chi-square test failed for {c1} vs {c2}: {e}")
+                    self.logger.warning(f"Chi-square test failed for {c1} vs {c2}: {e}")
 
         return {
             "n_features": len(cat_cols),
@@ -274,7 +368,7 @@ class CorrelationAnalyzer(BaseAgent):
 
     # === NAZWA_SEKCJI === CECHY ↔ TARGET ===
     def _analyze_target_correlations(self, df: pd.DataFrame, target_column: str) -> Dict[str, Any]:
-        """Analyze correlations between features and target (dobór miary do typu)."""
+        """Zależności cech względem targetu — dobór miary do typu celu/cechy."""
         cfg = self.config
         target = df[target_column]
         features = df.drop(columns=[target_column])
@@ -282,11 +376,11 @@ class CorrelationAnalyzer(BaseAgent):
         numeric_results: Dict[str, Dict[str, Any]] = {}
         categorical_results: Dict[str, Dict[str, Any]] = {}
 
-        # 1) TARGET NUMERYCZNY
+        # (1) Target numeryczny
         if pd.api.types.is_numeric_dtype(target):
             y = pd.to_numeric(target, errors="coerce")
 
-            # numeric features → Pearson/Spearman (wybieramy silniejszą |r|)
+            # numeric → Pearson/Spearman (silniejsza |r|)
             for col in features.select_dtypes(include=[np.number]).columns:
                 x = pd.to_numeric(features[col], errors="coerce")
                 valid = x.notna() & y.notna()
@@ -314,31 +408,35 @@ class CorrelationAnalyzer(BaseAgent):
                     "correlation": pick,
                     "abs_correlation": float(abs(pick)),
                     "method": method,
-                    "n": int(valid.sum())
+                    "n": int(valid.sum()),
                 }
 
-            # categorical features → η² (ANOVA effect size)
+            # categorical → η² (ANOVA effect size)
             for col in features.select_dtypes(include=["object", "category"]).columns:
                 ynum = pd.to_numeric(target, errors="coerce")
                 g = pd.DataFrame({"y": ynum, "cat": features[col].astype("category")}).dropna()
                 if g.empty or g["cat"].nunique() < 2:
                     continue
                 try:
-                    overall = g["y"].mean()
+                    overall = float(g["y"].mean())
                     groups = [grp["y"].values for _, grp in g.groupby("cat")]
-                    ss_between = float(sum(len(v) * (float(v.mean()) - overall) ** 2 for v in groups if len(v) > 0))
+                    ss_between = float(sum(len(v) * (float(np.mean(v)) - overall) ** 2 for v in groups if len(v) > 0))
                     ss_total = float(((g["y"] - overall) ** 2).sum())
                     eta_sq = float(ss_between / ss_total) if ss_total > 0 else 0.0
-                    categorical_results[str(col)] = {"association": float(np.clip(eta_sq, 0.0, 1.0)), "metric": "eta_squared", "n": int(len(g))}
+                    categorical_results[str(col)] = {
+                        "association": float(np.clip(eta_sq, 0.0, 1.0)),
+                        "metric": "eta_squared",
+                        "n": int(len(g)),
+                    }
                 except Exception:
                     pass
 
-        # 2) TARGET KATEGORYCZNY (w tym binarny)
+        # (2) Target kategoryczny (binarny lub multiklasa)
         else:
             t_non_na = target.dropna()
             classes = t_non_na.unique()
 
-            # numeric features → point-biserial (binarny) / Spearman na kodach (multiklasa)
+            # numeric → point-biserial (binarny) / Spearman na kodach (multiklasa)
             for col in features.select_dtypes(include=[np.number]).columns:
                 x = pd.to_numeric(features[col], errors="coerce")
                 df_valid = pd.DataFrame({"x": x, "y": target}).dropna()
@@ -348,25 +446,29 @@ class CorrelationAnalyzer(BaseAgent):
                     if len(classes) == 2:
                         mapping = {cls: i for i, cls in enumerate(sorted(classes, key=str))}
                         yb = df_valid["y"].map(mapping)
-                        # guard na stałe wektory (pointbiserialr wymaga zmienności)
+                        # pointbiserialr wymaga zmienności obu zmiennych
                         if df_valid["x"].nunique() > 1 and yb.nunique() == 2:
                             r, _ = pointbiserialr(df_valid["x"], yb)
                             r = float(np.clip(r, -1.0, 1.0))
                             numeric_results[str(col)] = {
-                                "correlation": r, "abs_correlation": float(abs(r)),
-                                "method": "pointbiserial", "n": int(len(df_valid))
+                                "correlation": r,
+                                "abs_correlation": float(abs(r)),
+                                "method": "pointbiserial",
+                                "n": int(len(df_valid)),
                             }
                     else:
                         r, _ = spearmanr(df_valid["x"], df_valid["y"].astype("category").cat.codes)
                         r = float(np.clip(r, -1.0, 1.0))
                         numeric_results[str(col)] = {
-                            "correlation": r, "abs_correlation": float(abs(r)),
-                            "method": "spearman_codes", "n": int(len(df_valid))
+                            "correlation": r,
+                            "abs_correlation": float(abs(r)),
+                            "method": "spearman_codes",
+                            "n": int(len(df_valid)),
                         }
                 except Exception:
                     pass
 
-            # categorical features → Cramér's V do targetu
+            # categorical → Cramér’s V względem targetu
             for col in features.select_dtypes(include=["object", "category"]).columns:
                 s1 = self._cap_categories(features[col], self.config.cat_max_levels)
                 s2 = self._cap_categories(target, self.config.cat_max_levels)
@@ -382,31 +484,38 @@ class CorrelationAnalyzer(BaseAgent):
                     k_corr = k - ((k - 1) ** 2) / max(1.0, (n - 1))
                     denom = max(1.0, min(k_corr - 1, r_corr - 1))
                     v = float(np.sqrt(phi2 / denom)) if denom > 0 else 0.0
-                    categorical_results[str(col)] = {"association": float(np.clip(v, 0.0, 1.0)), "metric": "cramers_v", "n": int(n)}
+                    categorical_results[str(col)] = {
+                        "association": float(np.clip(v, 0.0, 1.0)),
+                        "metric": "cramers_v",
+                        "n": int(n),
+                    }
                 except Exception:
                     pass
 
-        # TOP-K po absolutnej sile
-        combined_top = {
-            **{k: v["abs_correlation"] for k, v in numeric_results.items() if np.isfinite(v.get("abs_correlation", np.nan))},
-            **{k: v["association"] for k, v in categorical_results.items() if np.isfinite(v.get("association", np.nan))}
-        }
+        # TOP-K cech względem targetu
+        combined_top: Dict[str, float] = {}
+        combined_top.update(
+            {k: v["abs_correlation"] for k, v in numeric_results.items() if np.isfinite(v.get("abs_correlation", np.nan))}
+        )
+        combined_top.update(
+            {k: v["association"] for k, v in categorical_results.items() if np.isfinite(v.get("association", np.nan))}
+        )
         top = [k for k, _ in sorted(combined_top.items(), key=lambda kv: kv[1], reverse=True)[: cfg.top_k_target_features]]
 
         return {
             "target_column": str(target_column),
             "numeric_features": numeric_results,
             "categorical_features": categorical_results,
-            "top_5_features": top
+            "top_5_features": top,  # nazwa klucza zgodna z kontraktem
         }
 
-    # === NAZWA_SEKCJI === IDENTYFIKACJA PAR WYSOKIEJ KORELACJI ===
+    # === NAZWA_SEKCJI === PARy WYSOKIEJ KORELACJI ===
     def _identify_high_correlations(
         self,
         numeric_corr: Dict[str, Any],
         threshold: float = 0.8
     ) -> List[Dict[str, Any]]:
-        """Identify highly correlated feature pairs (|r| > threshold)."""
+        """Identyfikuje pary cech o |r| > threshold (na macierzy wybranej metody)."""
         cm = numeric_corr.get("correlation_matrix")
         if cm is None:
             return []
@@ -443,14 +552,14 @@ class CorrelationAnalyzer(BaseAgent):
         high_corr: List[Dict[str, Any]],
         target_corr: Optional[Dict[str, Any]]
     ) -> List[str]:
-        """Build actionable, concise recommendations."""
+        """Tworzy zwięzłe, praktyczne rekomendacje na bazie wyników."""
         rec: List[str] = []
 
         # Multikolinearność
         if high_corr:
             rec.append(
                 f"🔍 Wykryto {len(high_corr)} par silnie skorelowanych cech (|r| > {self.config.high_corr_threshold:.2f}). "
-                "Rozważ usunięcie/połączenie jednej z każdej pary albo regularizację (L1/L2) / PCA."
+                "Rozważ usunięcie/połączenie jednej z każdej pary, regularizację (L1/L2) lub redukcję wymiaru (PCA)."
             )
             for i, pair in enumerate(high_corr[:3], 1):
                 rec.append(f"  {i}. {pair['feature1']} ↔ {pair['feature2']}: r = {pair['correlation']:.3f}")
@@ -465,7 +574,8 @@ class CorrelationAnalyzer(BaseAgent):
         if not rec:
             rec.append("✅ Brak silnych korelacji — cechy wydają się zróżnicowane, co sprzyja modelowaniu.")
 
-        return rec
+        # Dedup/porządek
+        return list(dict.fromkeys([r for r in rec if r]))
 
     # === NAZWA_SEKCJI === POMOCNICZE ===
     @staticmethod
@@ -524,5 +634,28 @@ class CorrelationAnalyzer(BaseAgent):
             "categorical_associations": {"n_features": 0, "associations": [], "n_significant": 0},
             "target_correlations": None,
             "high_correlations": [],
-            "recommendations": ["Brak danych do analizy korelacji."]
+            "recommendations": ["Brak danych do analizy korelacji."],
         }
+
+    # === NAZWA_SEKCJI === CACHE FINGERPRINT ===
+    def _make_cache_key(self, df: pd.DataFrame, target_column: Optional[str]) -> str:
+        """
+        Tworzy stabilny klucz cache na bazie kształtu, dtypes i hash top-1000 wierszy.
+        Nie serializuje pełnych danych — szybki i bezpieczny fingerprint.
+        """
+        try:
+            from pandas.util import hash_pandas_object
+            top = df.head(1_000)
+            h = hash_pandas_object(top, index=True).values
+            # Użyj kształtu, dtypes i skrótu wartości
+            shape = (df.shape[0], df.shape[1])
+            dtypes = tuple((c, str(t)) for c, t in df.dtypes.items())
+            tgt = str(target_column) if target_column is not None else "None"
+            key = f"{shape}|{dtypes}|{tgt}|{int(h.sum() % (10**12))}"
+            return key
+        except Exception:
+            # Fallback — mniej precyzyjne, ale bezpieczne
+            shape = (df.shape[0], df.shape[1])
+            dtypes = tuple((c, str(t)) for c, t in df.dtypes.items())
+            tgt = str(target_column) if target_column is not None else "None"
+            return f"{shape}|{dtypes}|{tgt}|fallback"

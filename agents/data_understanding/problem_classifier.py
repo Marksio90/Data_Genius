@@ -65,6 +65,8 @@ def _truncate(obj: Any, limit: int) -> str:
 
 def _is_numeric_series_like(s: pd.Series) -> bool:
     """Heurystyka: czy seria może być traktowana jako numeryczna po konwersji."""
+    if pd.api.types.is_bool_dtype(s):
+        return True
     if pd.api.types.is_numeric_dtype(s):
         return True
     if s.dtype == "object":
@@ -89,6 +91,8 @@ def _is_id_like(s: pd.Series, ratio_threshold: float) -> bool:
 
 def _coerce_numeric_series(s: pd.Series) -> pd.Series:
     """Bezpieczna próba rzutowania do float (z kropką zamiast przecinka)."""
+    if pd.api.types.is_bool_dtype(s):
+        return s.astype(int).astype(float)
     if pd.api.types.is_numeric_dtype(s):
         return s.astype(float)
     try:
@@ -202,8 +206,8 @@ class ProblemClassifier(BaseAgent):
             if problem_type_str not in ("classification", "regression"):
                 problem_type_str = self._fallback_problem_type(target)
             else:
-                # korekta: numeric dtype, ale bardzo mało unikalnych → classification (np. {0,1,2})
-                if pd.api.types.is_numeric_dtype(target):
+                # korekta: numeric/boolean dtype, ale bardzo mało unikalnych → classification (np. {0,1,2})
+                if pd.api.types.is_bool_dtype(target) or pd.api.types.is_numeric_dtype(target):
                     nunique = int(target.nunique(dropna=True))
                     if nunique <= self.config.small_unique_threshold:
                         problem_type_str = "classification"
@@ -362,11 +366,11 @@ class ProblemClassifier(BaseAgent):
             }
 
         t = target_clean.copy()
-        if cfg.treat_numeric_str_as_numeric and not pd.api.types.is_numeric_dtype(t):
+        if cfg.treat_numeric_str_as_numeric and not (pd.api.types.is_numeric_dtype(t) or pd.api.types.is_bool_dtype(t)):
             t = _coerce_numeric_series(t)
 
         # jeśli nadal nie numeric → spróbuj jeszcze raz
-        if not pd.api.types.is_numeric_dtype(t):
+        if not pd.api.types.is_numeric_dtype(t) and not pd.api.types.is_bool_dtype(t):
             try:
                 t = pd.to_numeric(t, errors="coerce").dropna()
             except Exception:
@@ -379,7 +383,10 @@ class ProblemClassifier(BaseAgent):
             }
 
         # Statystyki
+        if pd.api.types.is_bool_dtype(t):
+            t = t.astype(int)
         t = t.astype(float)
+
         mean = float(t.mean())
         std = float(t.std(ddof=1)) if len(t) > 1 else 0.0
         cv = float(std / mean) if mean != 0 else None
