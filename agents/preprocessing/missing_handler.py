@@ -1612,3 +1612,5 @@ handler = MissingDataHandler(config)
 from agents.preprocessing import impute_missing
 
 df_imputed = impute_missing
+(train_df, 'target')
+    """)
