@@ -1,439 +1,972 @@
-# === missing_data_handler.py ===
+# agents/preprocessing/missing_data_handler.py
 """
-DataGenius PRO - Missing Data Handler (PRO++++++)
-Intelligent, configurable missing data imputation with full telemetry, datetime support,
-safe KNN (with scaling), optional group-wise imputation, and deterministic apply_to_new.
+╔════════════════════════════════════════════════════════════════════════════╗
+║  DataGenius PRO Master Enterprise ++++ — Missing Data Handler v6.0       ║
+║  ─────────────────────────────────────────────────────────────────────────  ║
+║  🚀 ENTERPRISE-GRADE INTELLIGENT MISSING DATA IMPUTATION                  ║
+║  ─────────────────────────────────────────────────────────────────────────  ║
+║  ✓ Multi-Strategy Imputation (median, mean, mode, KNN, constant)         ║
+║  ✓ Type-Aware Processing (numeric, categorical, datetime)                ║
+║  ✓ Missing Value Indicators (automatic feature generation)               ║
+║  ✓ Group-wise Imputation (per-category statistics)                       ║
+║  ✓ Extreme Missing Handling (column/row dropping)                        ║
+║  ✓ KNN with Automatic Scaling                                            ║
+║  ✓ Datetime Imputation (multiple strategies)                             ║
+║  ✓ Deterministic Apply to New Data                                       ║
+║  ✓ Comprehensive Reporting & Telemetry                                   ║
+║  ✓ Production-Ready with Safety Guards                                   ║
+╚════════════════════════════════════════════════════════════════════════════╝
 
-Deps: pandas, numpy, scikit-learn, loguru
+Architecture:
+    ┌─────────────────────────────────────────────────────────────┐
+    │           MissingDataHandler Core                           │
+    ├─────────────────────────────────────────────────────────────┤
+    │  1. Missing Data Analysis & Reporting                       │
+    │  2. Extreme Missing Detection (drop columns/rows)           │
+    │  3. Missing Indicators Generation                           │
+    │  4. Type-Specific Imputation                                │
+    │     • Numeric: median, mean, KNN, constant                  │
+    │     • Categorical: mode, constant, drop                     │
+    │     • Datetime: median, mode, forward/backward fill         │
+    │  5. Group-wise Statistics (optional)                        │
+    │  6. Fitted Imputer Storage                                  │
+    │  7. Deterministic Apply to New Data                         │
+    └─────────────────────────────────────────────────────────────┘
+
+Imputation Strategies:
+    Numeric:
+      • auto     → median (robust default)
+      • median   → robust to outliers
+      • mean     → faster, sensitive to outliers
+      • KNN      → multivariate, scaled automatically
+      • constant → fill with specific value
+    
+    Categorical:
+      • auto           → most_frequent
+      • most_frequent  → mode
+      • constant       → fill with token (e.g., '<MISSING>')
+      • drop           → drop rows with missing
+    
+    Datetime:
+      • auto          → median
+      • median        → middle timestamp
+      • most_frequent → mode
+      • forward_fill  → propagate forward
+      • backward_fill → propagate backward
+      • constant      → specific timestamp
+
+Dependencies:
+    • Required: pandas, numpy, scikit-learn, loguru
+
+Usage:
+```python
+    from agents.preprocessing import MissingDataHandler, MissingHandlerConfig
+    
+    # Basic usage
+    handler = MissingDataHandler()
+    result = handler.execute(
+        data=train_df,
+        target_column='target'
+    )
+    
+    df_imputed = result.data['data']
+    fitted = result.data['fitted']
+    
+    # Apply to new data
+    test_imputed = MissingDataHandler.apply_to_new(test_df, fitted)
+    
+    # Custom configuration
+    config = MissingHandlerConfig(
+        strategy_numeric='knn',
+        add_numeric_missing_indicators=True,
+        enable_groupwise_imputation=True
+    )
+    handler = MissingDataHandler(config)
+```
 """
 
 from __future__ import annotations
 
+import sys
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List, Literal
+import warnings
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from loguru import logger
-from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
-from core.base_agent import BaseAgent, AgentResult
+# ═══════════════════════════════════════════════════════════════════════════
+# Logging Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
+try:
+    from loguru import logger
+    
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan> | <level>{message}</level>",
+        level="INFO"
+    )
+    logger.add(
+        "logs/missing_data_handler_{time:YYYY-MM-DD}.log",
+        rotation="00:00",
+        retention="30 days",
+        compression="zip",
+        level="DEBUG"
+    )
+except ImportError:
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
+    )
+    logger = logging.getLogger(__name__)
 
 
-# === KONFIGURACJA ===
-@dataclass(frozen=True)
+# ═══════════════════════════════════════════════════════════════════════════
+# Dependencies
+# ═══════════════════════════════════════════════════════════════════════════
+
+try:
+    from core.base_agent import BaseAgent, AgentResult
+except ImportError:
+    logger.warning("⚠ core.base_agent not found - using fallback")
+    
+    class BaseAgent:
+        def __init__(self, name: str, description: str):
+            self.name = name
+            self.description = description
+            self.logger = logger
+    
+    class AgentResult:
+        def __init__(self, agent_name: str):
+            self.agent_name = agent_name
+            self.data: Dict[str, Any] = {}
+            self.errors: List[str] = []
+            self.warnings: List[str] = []
+        
+        def add_error(self, error: str):
+            self.errors.append(error)
+        
+        def add_warning(self, warning: str):
+            self.warnings.append(warning)
+        
+        def is_success(self) -> bool:
+            return len(self.errors) == 0
+
+# Suppress warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Module Metadata
+# ═══════════════════════════════════════════════════════════════════════════
+
+__all__ = ["MissingHandlerConfig", "MissingDataHandler", "impute_missing"]
+__version__ = "6.0.0-enterprise"
+__author__ = "DataGenius Enterprise Team"
+__license__ = "Proprietary"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION: Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=False)
 class MissingHandlerConfig:
-    # Drop kolumn ze skrajnymi brakami
-    drop_column_missing_pct_threshold: float = 0.80   # >80% braków → drop kolumny
-
-    # Strategia numeryczna
+    """
+    🎯 **Missing Data Handler Configuration**
+    
+    Complete configuration for intelligent missing data imputation.
+    
+    Column Dropping:
+        drop_column_missing_pct_threshold: Drop columns with >X% missing (default: 0.80)
+        
+    Numeric Strategy:
+        strategy_numeric: 'auto', 'median', 'mean', 'constant', 'knn' (default: 'auto')
+        constant_numeric_fill_value: Value for constant strategy (default: 0.0)
+        knn_neighbors: Number of KNN neighbors (default: 5)
+        knn_max_features: Max features for KNN (default: 100)
+        
+    Categorical Strategy:
+        strategy_categorical: 'auto', 'most_frequent', 'constant', 'drop' (default: 'auto')
+        constant_categorical_fill_value: Token for constant (default: '<MISSING>')
+        
+    Datetime Strategy:
+        strategy_datetime: 'auto', 'median', 'most_frequent', 'forward_fill', 
+                          'backward_fill', 'constant' (default: 'auto')
+        constant_datetime_fill_value: Timestamp for constant (default: None)
+        
+    Missing Indicators:
+        add_numeric_missing_indicators: Add binary indicators (default: True)
+        add_categorical_missing_indicators: Add binary indicators (default: False)
+        add_datetime_missing_indicators: Add binary indicators (default: True)
+        indicator_suffix: Suffix for indicator columns (default: '__ismissing')
+        
+    Target Handling:
+        drop_rows_if_target_missing: Drop rows with missing target (default: True)
+        
+    Group-wise Imputation:
+        enable_groupwise_imputation: Enable per-group statistics (default: False)
+        group_cols: Grouping columns (default: None)
+        group_min_size: Minimum group size (default: 3)
+        
+    Behavior:
+        preserve_column_order: Maintain original column order (default: True)
+        report_top_n: Number of columns in summary (default: 10)
+        random_state: Random seed for reproducibility (default: 42)
+    """
+    
+    # Column dropping
+    drop_column_missing_pct_threshold: float = 0.80
+    
+    # Numeric strategy
     strategy_numeric: Literal["auto", "median", "mean", "constant", "knn"] = "auto"
     constant_numeric_fill_value: float = 0.0
     knn_neighbors: int = 5
-    knn_max_features: Optional[int] = 100            # limit bezpieczeństwa dla KNN (wysokie wymiary = wolno)
-
-    # Strategia kategoryczna
+    knn_max_features: Optional[int] = 100
+    
+    # Categorical strategy
     strategy_categorical: Literal["auto", "most_frequent", "constant", "drop"] = "auto"
     constant_categorical_fill_value: str = "<MISSING>"
-
-    # Strategia dla datetime
-    strategy_datetime: Literal["auto", "median", "most_frequent", "forward_fill", "backward_fill", "constant"] = "auto"
-    constant_datetime_fill_value: Optional[pd.Timestamp] = None  # albo np. pd.Timestamp("1970-01-01")
-
-    # Wskaźniki braków
+    
+    # Datetime strategy
+    strategy_datetime: Literal[
+        "auto", "median", "most_frequent", 
+        "forward_fill", "backward_fill", "constant"
+    ] = "auto"
+    constant_datetime_fill_value: Optional[pd.Timestamp] = None
+    
+    # Missing indicators
     add_numeric_missing_indicators: bool = True
     add_categorical_missing_indicators: bool = False
     add_datetime_missing_indicators: bool = True
     indicator_suffix: str = "__ismissing"
-
-    # Target / wiersze
+    
+    # Target handling
     drop_rows_if_target_missing: bool = True
-
-    # Stabilność / ergonomia
+    
+    # Group-wise imputation
+    enable_groupwise_imputation: bool = False
+    group_cols: Optional[List[str]] = None
+    group_min_size: int = 3
+    
+    # Behavior
     preserve_column_order: bool = True
-    report_top_n: int = 10        # ile kolumn pokazać w skróconym logu
-    random_state: int = 42        # pod deterministykę w KNN (pośrednio do shuffli w sklearn > brak)
-    enable_groupwise_imputation: bool = False  # imputuj w obrębie grup (np. per user_id)
-    group_cols: Optional[List[str]] = None     # kolumny kluczy dla trybu grupowego
-    group_min_size: int = 3                    # minimalny rozmiar grupy, by stosować grupowe statystyki
+    report_top_n: int = 10
+    random_state: int = 42
+    
+    def __post_init__(self):
+        """Validate configuration."""
+        if not 0 < self.drop_column_missing_pct_threshold <= 1:
+            raise ValueError(
+                f"drop_column_missing_pct_threshold must be in (0, 1], "
+                f"got {self.drop_column_missing_pct_threshold}"
+            )
+        
+        if self.knn_neighbors < 1:
+            raise ValueError(f"knn_neighbors must be >= 1, got {self.knn_neighbors}")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+    
+    @classmethod
+    def create_simple(cls) -> 'MissingHandlerConfig':
+        """Create simple configuration (fast, no KNN)."""
+        return cls(
+            strategy_numeric='median',
+            strategy_categorical='most_frequent',
+            add_numeric_missing_indicators=False,
+            enable_groupwise_imputation=False
+        )
+    
+    @classmethod
+    def create_advanced(cls) -> 'MissingHandlerConfig':
+        """Create advanced configuration (KNN, indicators, group-wise)."""
+        return cls(
+            strategy_numeric='knn',
+            add_numeric_missing_indicators=True,
+            add_categorical_missing_indicators=True,
+            add_datetime_missing_indicators=True,
+            enable_groupwise_imputation=True
+        )
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION: Missing Data Handler (Main Class)
+# ═══════════════════════════════════════════════════════════════════════════
 
 class MissingDataHandler(BaseAgent):
     """
-    Intelligent missing data handler with telemetry and reusable fitted imputers.
+    🚀 **MissingDataHandler PRO Master Enterprise ++++**
+    
+    Enterprise-grade intelligent missing data imputation system.
+    
+    Capabilities:
+      1. Comprehensive missing data analysis
+      2. Extreme missing detection & handling
+      3. Type-aware imputation (numeric, categorical, datetime)
+      4. Multiple imputation strategies
+      5. KNN imputation with automatic scaling
+      6. Missing value indicators
+      7. Group-wise statistics
+      8. Deterministic transformation
+      9. Fitted imputer reuse
+     10. Production-ready validation
+    
+    Imputation Flow:
+```
+        ┌──────────────────────────────────────────┐
+        │ Input DataFrame                          │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Missing Data Analysis                    │
+        │  • Per-column missing %                  │
+        │  • Type detection                        │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Drop Extreme Missing Columns             │
+        │  (>80% missing by default)               │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Drop Rows (target missing)               │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Generate Missing Indicators              │
+        │  (before imputation)                     │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Type-Specific Imputation                 │
+        │  • Numeric (median/mean/KNN/constant)    │
+        │  • Categorical (mode/constant/drop)      │
+        │  • Datetime (median/mode/ffill/bfill)    │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Store Fitted Imputers                    │
+        └────────────┬─────────────────────────────┘
+                     │
+        ┌────────────▼─────────────────────────────┐
+        │ Output: Imputed DataFrame + Metadata     │
+        └──────────────────────────────────────────┘
+```
+    
+    Usage:
+```python
+        # Basic usage
+        handler = MissingDataHandler()
+        
+        result = handler.execute(
+            data=train_df,
+            target_column='target'
+        )
+        
+        df_imputed = result.data['data']
+        fitted = result.data['fitted']
+        report = result.data['imputation_report']
+        
+        # Apply to new data
+        test_imputed = MissingDataHandler.apply_to_new(test_df, fitted)
+        
+        # Custom configuration
+        config = MissingHandlerConfig.create_advanced()
+        handler = MissingDataHandler(config)
+```
     """
-
+    
+    version: str = __version__
+    
     def __init__(self, config: Optional[MissingHandlerConfig] = None):
+        """
+        Initialize missing data handler.
+        
+        Args:
+            config: Optional custom configuration
+        """
         super().__init__(
             name="MissingDataHandler",
-            description="Intelligent missing data imputation"
+            description="Enterprise intelligent missing data imputation"
         )
+        
         self.config = config or MissingHandlerConfig()
-
-    # === API GŁÓWNE ===
+        self._log = logger.bind(agent="MissingDataHandler", version=self.version)
+        
+        self._log.info(f"✓ MissingDataHandler v{self.version} initialized")
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Main Execution
+    # ───────────────────────────────────────────────────────────────────
+    
     def execute(
         self,
         data: pd.DataFrame,
         target_column: str,
         strategy: Optional[str] = None,
         *,
-        datetime_cols: Optional[List[str]] = None,   # wymuś kolumny datetime (gdy dtypes są object)
-        use_groupwise: Optional[bool] = None,        # nadpisz config.enable_groupwise_imputation
-        group_cols: Optional[List[str]] = None,      # nadpisz config.group_cols
+        datetime_cols: Optional[List[str]] = None,
+        use_groupwise: Optional[bool] = None,
+        group_cols: Optional[List[str]] = None,
         **kwargs: Any
     ) -> AgentResult:
         """
-        Impute missing data with robust defaults.
-
+        🎯 **Execute Missing Data Imputation**
+        
+        Intelligently handle missing values with multiple strategies.
+        
         Args:
-            data: pełny DataFrame (cechy + target)
-            target_column: nazwa kolumny celu
-            strategy: (legacy override) {"auto","mean","median","mode","knn","drop"} – patrz _resolve_strategies
-            datetime_cols: lista kolumn traktowanych jako datetime (opcjonalnie)
-            use_groupwise: czy stosować imputację grupową (per klucz)
-            group_cols: kolumny kluczy dla imputacji grupowej
+            data: Input DataFrame (features + target)
+            target_column: Target column name
+            strategy: Legacy strategy override
+            datetime_cols: Force datetime parsing for columns
+            use_groupwise: Enable group-wise imputation
+            group_cols: Grouping columns for group-wise
+            **kwargs: Additional parameters
+        
         Returns:
-            AgentResult.data:
-                - data: DataFrame po imputacji
-                - fitted: {specyfikacja imputatorów i kolumn}
-                - imputation_report: raport braków per kolumna
-                - imputation_log: lista operacji
-                - dropped: {"columns": [...], "rows_target": int, "rows_categorical": int}
-                - shapes: {"original": (r,c), "final": (r,c)}
-                - telemetry: czasy kroków, liczby itp.
+            AgentResult with imputed data and fitted imputers
         """
         result = AgentResult(agent_name=self.name)
-        tel: Dict[str, Any] = {"timing_s": {}, "counts": {}, "notes": []}
-        t0 = time.perf_counter()
-
+        t_start = time.perf_counter()
+        telemetry: Dict[str, Any] = {
+            "timing_s": {},
+            "counts": {},
+            "notes": []
+        }
+        
         try:
+            self._log.info(
+                f"🔧 Starting missing data handling | "
+                f"rows={len(data):,} | "
+                f"cols={len(data.columns)}"
+            )
+            
+            # Validation
             if not isinstance(data, pd.DataFrame) or data.empty:
-                raise ValueError("'data' must be a non-empty pandas DataFrame")
+                raise ValueError("'data' must be non-empty DataFrame")
+            
             if target_column not in data.columns:
-                raise ValueError(f"Target column '{target_column}' not found in data")
-
+                raise ValueError(f"Target column '{target_column}' not found")
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 1: Preparation
+            # ═══════════════════════════════════════════════════════════
+            
             df = data.copy()
             original_order = list(df.columns)
-
-            # Typy datetime (opcjonalne wymuszenie)
+            
+            # Force datetime parsing
             if datetime_cols:
-                for c in datetime_cols:
-                    if c in df.columns and not pd.api.types.is_datetime64_any_dtype(df[c]):
-                        with pd.option_context("mode.use_inf_as_na", True):
-                            df[c] = pd.to_datetime(df[c], errors="coerce")
-
-            # === 1) RAPORT BRAKÓW ===
+                for col in datetime_cols:
+                    if col in df.columns and not pd.api.types.is_datetime64_any_dtype(df[col]):
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 2: Missing Data Analysis
+            # ═══════════════════════════════════════════════════════════
+            
             t = time.perf_counter()
-            report = self._missing_report(df)
-            tel["timing_s"]["report"] = round(time.perf_counter() - t, 4)
-
-            self._log_top_missing(report, top_n=self.config.report_top_n)
-
-            # === 2) DROP kolumn o skrajnych brakach ===
-            to_drop_cols = self._columns_to_drop(report, self.config.drop_column_missing_pct_threshold)
-            if to_drop_cols:
-                self.logger.warning(
-                    f"Dropping {len(to_drop_cols)} columns with > {int(self.config.drop_column_missing_pct_threshold*100)}% missing."
+            report = self._analyze_missing(df)
+            telemetry["timing_s"]["analysis"] = round(time.perf_counter() - t, 4)
+            
+            self._log_top_missing(report, self.config.report_top_n)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 3: Drop Extreme Missing Columns
+            # ═══════════════════════════════════════════════════════════
+            
+            cols_to_drop = self._get_columns_to_drop(
+                report,
+                self.config.drop_column_missing_pct_threshold
+            )
+            
+            if cols_to_drop:
+                self._log.warning(
+                    f"Dropping {len(cols_to_drop)} columns with >"
+                    f"{int(self.config.drop_column_missing_pct_threshold*100)}% missing"
                 )
-                df.drop(columns=to_drop_cols, inplace=True, errors="ignore")
-
-            # === 3) Target: usuń wiersze z brakiem (domyślnie) ===
+                df.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 4: Handle Target Missing
+            # ═══════════════════════════════════════════════════════════
+            
             rows_dropped_target = 0
-            if self.config.drop_rows_if_target_missing and df[target_column].isna().any():
-                rows_dropped_target = int(df[target_column].isna().sum())
-                df = df.loc[~df[target_column].isna()].copy()
-                self.logger.warning(f"Dropped {rows_dropped_target} rows with missing target.")
-
-            # === 4) Split X / y
+            if self.config.drop_rows_if_target_missing:
+                if df[target_column].isna().any():
+                    rows_dropped_target = int(df[target_column].isna().sum())
+                    df = df[~df[target_column].isna()].copy()
+                    self._log.warning(
+                        f"Dropped {rows_dropped_target} rows with missing target"
+                    )
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 5: Split X and y
+            # ═══════════════════════════════════════════════════════════
+            
             X = df.drop(columns=[target_column])
             y = df[target_column]
-
-            # === 5) Wskaźniki braków (przed imputacją)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 6: Add Missing Indicators (before imputation)
+            # ═══════════════════════════════════════════════════════════
+            
             t = time.perf_counter()
             ind_num, ind_cat, ind_dt = self._add_missing_indicators(X)
-            tel["timing_s"]["indicators"] = round(time.perf_counter() - t, 4)
-
-            # === 6) STRATEGIE (legacy -> nowe)
+            telemetry["timing_s"]["indicators"] = round(time.perf_counter() - t, 4)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 7: Resolve Strategies
+            # ═══════════════════════════════════════════════════════════
+            
             num_strategy, cat_strategy = self._resolve_strategies(strategy)
             dt_strategy = self._resolve_datetime_strategy()
-
-            # === 7) (Opcjonalnie) imputacja grupowa (statystyki w obrębie kluczy)
-            use_grp = self.config.enable_groupwise_imputation if use_groupwise is None else bool(use_groupwise)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 8: Group-wise Statistics (optional)
+            # ═══════════════════════════════════════════════════════════
+            
+            use_grp = use_groupwise if use_groupwise is not None else \
+                      self.config.enable_groupwise_imputation
             grp_cols = group_cols or self.config.group_cols or []
+            
             group_stats = None
             if use_grp and grp_cols:
                 t = time.perf_counter()
                 group_stats = self._compute_group_stats(X, grp_cols)
-                tel["timing_s"]["group_stats"] = round(time.perf_counter() - t, 4)
-                tel["notes"].append(f"Group-wise enabled on {grp_cols}")
-
-            # === 8) IMPUTACJA: NUMERIC
+                telemetry["timing_s"]["group_stats"] = round(time.perf_counter() - t, 4)
+                telemetry["notes"].append(f"Group-wise enabled: {grp_cols}")
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 9: Numeric Imputation
+            # ═══════════════════════════════════════════════════════════
+            
             t = time.perf_counter()
-            X, num_imputer, num_cols_imputed = self._impute_numeric(
-                X, num_strategy,
+            X, num_imputer, num_cols = self._impute_numeric(
+                X,
+                num_strategy,
                 group_stats=group_stats,
                 grp_cols=grp_cols
             )
-            tel["timing_s"]["numeric"] = round(time.perf_counter() - t, 4)
-
-            # === 9) IMPUTACJA: CATEGORICAL (z ewentualnym dropem wierszy)
+            telemetry["timing_s"]["numeric"] = round(time.perf_counter() - t, 4)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 10: Categorical Imputation
+            # ═══════════════════════════════════════════════════════════
+            
             t = time.perf_counter()
             rows_dropped_cat = 0
-            if cat_strategy == "drop":
-                cat_cols_all = list(X.select_dtypes(include=["object", "category"]).columns)
+            
+            if cat_strategy == 'drop':
+                # Drop rows with missing categorical
+                cat_cols_all = list(X.select_dtypes(
+                    include=["object", "category"]
+                ).columns)
+                
                 if cat_cols_all:
                     mask = X[cat_cols_all].isna().any(axis=1)
                     rows_dropped_cat = int(mask.sum())
+                    
                     if rows_dropped_cat > 0:
-                        X = X.loc[~mask].copy()
+                        X = X[~mask].copy()
                         y = y.loc[X.index].copy()
-                        self.logger.warning(f"Dropped {rows_dropped_cat} rows with missing categorical values.")
-            X, cat_imputer, cat_cols_imputed = self._impute_categorical(
-                X, cat_strategy,
+                        self._log.warning(
+                            f"Dropped {rows_dropped_cat} rows with missing categorical"
+                        )
+            
+            X, cat_imputer, cat_cols = self._impute_categorical(
+                X,
+                cat_strategy,
                 group_stats=group_stats,
                 grp_cols=grp_cols
             )
-            tel["timing_s"]["categorical"] = round(time.perf_counter() - t, 4)
-
-            # === 10) IMPUTACJA: DATETIME
+            telemetry["timing_s"]["categorical"] = round(time.perf_counter() - t, 4)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 11: Datetime Imputation
+            # ═══════════════════════════════════════════════════════════
+            
             t = time.perf_counter()
-            X, dt_imputer, dt_cols_imputed = self._impute_datetime(
-                X, dt_strategy,
+            X, dt_imputer, dt_cols = self._impute_datetime(
+                X,
+                dt_strategy,
                 constant_value=self.config.constant_datetime_fill_value
             )
-            tel["timing_s"]["datetime"] = round(time.perf_counter() - t, 4)
-
-            # === 11) Rekonstrukcja ramki z targetem
+            telemetry["timing_s"]["datetime"] = round(time.perf_counter() - t, 4)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 12: Reconstruct DataFrame
+            # ═══════════════════════════════════════════════════════════
+            
             X[target_column] = y.values
+            
+            # Preserve column order
             if self.config.preserve_column_order:
-                new_cols = [c for c in original_order if c in X.columns] + [c for c in X.columns if c not in original_order]
+                new_cols = [c for c in original_order if c in X.columns] + \
+                          [c for c in X.columns if c not in original_order]
                 X = X[new_cols]
-
-            # === 12) PODSUMOWANIE / OUTPUT
-            imputation_log: List[str] = []
-            if to_drop_cols:
-                imputation_log.append(f"Dropped columns (missing>{int(self.config.drop_column_missing_pct_threshold*100)}%): {to_drop_cols}")
-            if rows_dropped_target:
-                imputation_log.append(f"Dropped {rows_dropped_target} rows with missing target.")
-            if rows_dropped_cat:
-                imputation_log.append(f"Dropped {rows_dropped_cat} rows due to categorical 'drop' strategy.")
-            if num_cols_imputed:
-                imputation_log.append(f"Imputed numeric columns ({num_strategy}): {num_cols_imputed}")
-            if cat_cols_imputed:
-                imputation_log.append(f"Imputed categorical columns ({cat_strategy}): {cat_cols_imputed}")
-            if dt_cols_imputed:
-                imputation_log.append(f"Imputed datetime columns ({dt_strategy}): {dt_cols_imputed}")
-            if ind_num:
-                imputation_log.append(f"Added numeric missing indicators: {ind_num}")
-            if ind_cat:
-                imputation_log.append(f"Added categorical missing indicators: {ind_cat}")
-            if ind_dt:
-                imputation_log.append(f"Added datetime missing indicators: {ind_dt}")
-            if not imputation_log:
-                imputation_log.append("No missing data operations were necessary.")
-
-            fitted = {
-                "numeric": {
-                    "strategy": num_strategy,
-                    "imputer": num_imputer,
-                    "columns": num_cols_imputed
-                },
-                "categorical": {
-                    "strategy": cat_strategy,
-                    "imputer": cat_imputer,
-                    "columns": cat_cols_imputed
-                },
-                "datetime": {
-                    "strategy": dt_strategy,
-                    "imputer": dt_imputer,
-                    "columns": dt_cols_imputed,
-                    "constant_value": self.config.constant_datetime_fill_value.isoformat()
-                        if isinstance(self.config.constant_datetime_fill_value, pd.Timestamp) else None
-                },
-                "indicators": {
-                    "numeric": ind_num,
-                    "categorical": ind_cat,
-                    "datetime": ind_dt,
-                    "suffix": self.config.indicator_suffix
-                },
-                "dropped_columns_threshold": {
-                    "threshold": self.config.drop_column_missing_pct_threshold,
-                    "columns": to_drop_cols
-                },
-                "target_column": target_column,
-                "preserve_column_order": self.config.preserve_column_order
-            }
-
-            tel["counts"].update({
-                "dropped_cols": len(to_drop_cols),
-                "imputed_num": len(num_cols_imputed),
-                "imputed_cat": len(cat_cols_imputed),
-                "imputed_dt": len(dt_cols_imputed),
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 13: Build Output
+            # ═══════════════════════════════════════════════════════════
+            
+            # Imputation log
+            imputation_log = self._build_imputation_log(
+                cols_to_drop=cols_to_drop,
+                rows_dropped_target=rows_dropped_target,
+                rows_dropped_cat=rows_dropped_cat,
+                num_strategy=num_strategy,
+                num_cols=num_cols,
+                cat_strategy=cat_strategy,
+                cat_cols=cat_cols,
+                dt_strategy=dt_strategy,
+                dt_cols=dt_cols,
+                ind_num=ind_num,
+                ind_cat=ind_cat,
+                ind_dt=ind_dt
+            )
+            
+            # Fitted imputers
+            fitted = self._build_fitted_dict(
+                num_strategy=num_strategy,
+                num_imputer=num_imputer,
+                num_cols=num_cols,
+                cat_strategy=cat_strategy,
+                cat_imputer=cat_imputer,
+                cat_cols=cat_cols,
+                dt_strategy=dt_strategy,
+                dt_imputer=dt_imputer,
+                dt_cols=dt_cols,
+                ind_num=ind_num,
+                ind_cat=ind_cat,
+                ind_dt=ind_dt,
+                cols_to_drop=cols_to_drop,
+                target_column=target_column
+            )
+            
+            # Telemetry
+            elapsed_s = time.perf_counter() - t_start
+            
+            telemetry["counts"] = {
+                "dropped_cols": len(cols_to_drop),
+                "imputed_numeric": len(num_cols),
+                "imputed_categorical": len(cat_cols),
+                "imputed_datetime": len(dt_cols),
                 "rows_dropped_target": rows_dropped_target,
-                "rows_dropped_cat": rows_dropped_cat
-            })
-            tel["timing_s"]["total"] = round(time.perf_counter() - t0, 4)
-
+                "rows_dropped_categorical": rows_dropped_cat
+            }
+            telemetry["timing_s"]["total"] = round(elapsed_s, 4)
+            
+            # ═══════════════════════════════════════════════════════════
+            # STAGE 14: Assemble Result
+            # ═══════════════════════════════════════════════════════════
+            
             result.data = {
                 "data": X,
                 "fitted": fitted,
                 "imputation_report": report,
                 "imputation_log": imputation_log,
                 "dropped": {
-                    "columns": to_drop_cols,
+                    "columns": cols_to_drop,
                     "rows_target": rows_dropped_target,
                     "rows_categorical": rows_dropped_cat
                 },
-                "shapes": {"original": tuple(data.shape), "final": tuple(X.shape)},
-                "telemetry": tel
+                "shapes": {
+                    "original": tuple(data.shape),
+                    "final": tuple(X.shape)
+                },
+                "telemetry": telemetry
             }
-            self.logger.success(
-                f"Missing data handled. Dropped {len(to_drop_cols)} col(s). "
-                f"Imputed num={len(num_cols_imputed)}, cat={len(cat_cols_imputed)}, dt={len(dt_cols_imputed)}."
+            
+            self._log.success(
+                f"✓ Imputation complete | "
+                f"dropped_cols={len(cols_to_drop)} | "
+                f"numeric={len(num_cols)} | "
+                f"categorical={len(cat_cols)} | "
+                f"datetime={len(dt_cols)} | "
+                f"time={elapsed_s:.2f}s"
             )
-
+        
         except Exception as e:
-            result.add_error(f"Missing data handling failed: {e}")
-            self.logger.error(f"Missing data handling error: {e}", exc_info=True)
-
+            error_msg = f"Missing data handling failed: {type(e).__name__}: {str(e)}"
+            result.add_error(error_msg)
+            self._log.error(error_msg, exc_info=True)
+        
         return result
-
-    # === RAPORT I LOGI ===
-    def _missing_report(self, df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Missing Data Analysis
+    # ───────────────────────────────────────────────────────────────────
+    
+    def _analyze_missing(
+        self,
+        df: pd.DataFrame
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Analyze missing data per column.
+        
+        Args:
+            df: DataFrame to analyze
+        
+        Returns:
+            Dictionary mapping column → {n_missing, pct_missing}
+        """
         n = len(df)
-        rep: Dict[str, Dict[str, float]] = {}
-        for c in df.columns:
-            miss = int(df[c].isna().sum())
-            rep[c] = {
-                "n_missing": miss,
-                "pct_missing": float(miss / max(1, n))
+        report: Dict[str, Dict[str, float]] = {}
+        
+        for col in df.columns:
+            n_missing = int(df[col].isna().sum())
+            pct_missing = n_missing / max(1, n)
+            
+            report[col] = {
+                "n_missing": n_missing,
+                "pct_missing": pct_missing
             }
-        return rep
-
-    def _columns_to_drop(self, report: Dict[str, Dict[str, float]], threshold: float) -> List[str]:
-        return [c for c, r in report.items() if r["pct_missing"] > threshold]
-
-    def _log_top_missing(self, report: Dict[str, Dict[str, float]], top_n: int = 10) -> None:
+        
+        return report
+    
+    def _get_columns_to_drop(
+        self,
+        report: Dict[str, Dict[str, float]],
+        threshold: float
+    ) -> List[str]:
+        """Get columns exceeding missing threshold."""
+        return [
+            col for col, stats in report.items()
+            if stats["pct_missing"] > threshold
+        ]
+    
+    def _log_top_missing(
+        self,
+        report: Dict[str, Dict[str, float]],
+        top_n: int
+    ) -> None:
+        """Log top columns by missing percentage."""
         if not report:
             return
-        top = sorted(report.items(), key=lambda kv: kv[1]["pct_missing"], reverse=True)[:top_n]
-        if top:
-            msg = ", ".join([f"{c}:{r['pct_missing']*100:.1f}%" for c, r in top if r["pct_missing"] > 0])
-            if msg:
-                self.logger.info(f"Top missing columns: {msg}")
+        
+        # Sort by missing percentage
+        sorted_cols = sorted(
+            report.items(),
+            key=lambda x: x[1]["pct_missing"],
+            reverse=True
+        )
+        
+        top = sorted_cols[:top_n]
+        
+        # Format message
+        msg_parts = []
+        for col, stats in top:
+            if stats["pct_missing"] > 0:
+                msg_parts.append(f"{col}: {stats['pct_missing']*100:.1f}%")
+        
+        if msg_parts:
+            self._log.info(f"Top missing: {', '.join(msg_parts)}")
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Strategy Resolution
+    # ───────────────────────────────────────────────────────────────────
 
-    def _resolve_strategies(self, strategy: Optional[str]) -> Tuple[str, str]:
+    def _resolve_strategies(
+        self,
+        strategy: Optional[str]
+    ) -> Tuple[str, str]:
         """
-        Legacy 'strategy' mapping:
-        - "mode" -> categorical most_frequent
-        - "drop" -> categorical drop
-        Numeric part: {"auto","mean","median","knn","constant"}
+        Resolve numeric and categorical strategies.
+        
+        Legacy mapping:
+          • 'mode' → categorical='most_frequent'
+          • 'drop' → categorical='drop'
+          • 'auto', 'mean', 'median', 'knn', 'constant' → numeric
+        
+        Args:
+            strategy: Legacy strategy override
+        
+        Returns:
+            Tuple of (numeric_strategy, categorical_strategy)
         """
-        num = self.config.strategy_numeric
-        cat = self.config.strategy_categorical
+        num_strategy = self.config.strategy_numeric
+        cat_strategy = self.config.strategy_categorical
+        
+        # Legacy override
         if strategy:
             s = strategy.lower().strip()
+            
             if s in {"auto", "mean", "median", "knn", "constant"}:
-                num = s
+                num_strategy = s
             elif s == "mode":
-                cat = "most_frequent"
+                cat_strategy = "most_frequent"
             elif s == "drop":
-                cat = "drop"
-        if num == "auto":
-            # heurystyka: median jest odporniejsza na skośność
-            num = "median"
-        if cat == "auto":
-            cat = "most_frequent"
-        return num, cat
-
+                cat_strategy = "drop"
+        
+        # Resolve 'auto'
+        if num_strategy == "auto":
+            num_strategy = "median"  # Robust default
+        
+        if cat_strategy == "auto":
+            cat_strategy = "most_frequent"
+        
+        return num_strategy, cat_strategy
+    
     def _resolve_datetime_strategy(self) -> str:
-        dt = self.config.strategy_datetime
-        if dt == "auto":
-            # Bezpieczna domyślna: median (środek rozkładu czasu)
-            return "median"
-        return dt
-
-    # === WSKAŹNIKI BRAKÓW ===
-    def _add_missing_indicators(self, X: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
+        """Resolve datetime strategy."""
+        dt_strategy = self.config.strategy_datetime
+        
+        if dt_strategy == "auto":
+            return "median"  # Robust default
+        
+        return dt_strategy
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Missing Indicators
+    # ───────────────────────────────────────────────────────────────────
+    
+    def _add_missing_indicators(
+        self,
+        X: pd.DataFrame
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """
+        Add binary missing indicators.
+        
+        Args:
+            X: DataFrame (modified in place)
+        
+        Returns:
+            Tuple of (numeric_indicators, categorical_indicators, datetime_indicators)
+        """
         added_num: List[str] = []
         added_cat: List[str] = []
         added_dt: List[str] = []
-        suf = self.config.indicator_suffix
-
+        
+        suffix = self.config.indicator_suffix
+        
+        # Numeric indicators
         if self.config.add_numeric_missing_indicators:
             num_cols = list(X.select_dtypes(include=[np.number]).columns)
-            for c in num_cols:
-                if X[c].isna().any():
-                    name = f"{c}{suf}"
-                    X[name] = X[c].isna().astype("Int8")
-                    added_num.append(name)
-
+            
+            for col in num_cols:
+                if X[col].isna().any():
+                    indicator_name = f"{col}{suffix}"
+                    X[indicator_name] = X[col].isna().astype("Int8")
+                    added_num.append(indicator_name)
+        
+        # Categorical indicators
         if self.config.add_categorical_missing_indicators:
             cat_cols = list(X.select_dtypes(include=["object", "category"]).columns)
-            for c in cat_cols:
-                if X[c].isna().any():
-                    name = f"{c}{suf}"
-                    X[name] = X[c].isna().astype("Int8")
-                    added_cat.append(name)
-
+            
+            for col in cat_cols:
+                if X[col].isna().any():
+                    indicator_name = f"{col}{suffix}"
+                    X[indicator_name] = X[col].isna().astype("Int8")
+                    added_cat.append(indicator_name)
+        
+        # Datetime indicators
         if self.config.add_datetime_missing_indicators:
-            dt_cols = list(X.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns)
-            for c in dt_cols:
-                if X[c].isna().any():
-                    name = f"{c}{suf}"
-                    X[name] = X[c].isna().astype("Int8")
-                    added_dt.append(name)
-
+            dt_cols = list(X.select_dtypes(
+                include=["datetime64[ns]", "datetime64[ns, UTC]"]
+            ).columns)
+            
+            for col in dt_cols:
+                if X[col].isna().any():
+                    indicator_name = f"{col}{suffix}"
+                    X[indicator_name] = X[col].isna().astype("Int8")
+                    added_dt.append(indicator_name)
+        
         return added_num, added_cat, added_dt
-
-    # === IMPUTACJA NUMERYCZNA ===
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Numeric Imputation
+    # ───────────────────────────────────────────────────────────────────
+    
     def _impute_numeric(
         self,
         X: pd.DataFrame,
         strategy: str,
-        *,
         group_stats: Optional[Dict[str, Dict[str, Any]]] = None,
         grp_cols: Optional[List[str]] = None
     ) -> Tuple[pd.DataFrame, Optional[Any], List[str]]:
+        """
+        Impute numeric columns.
+        
+        Args:
+            X: DataFrame (modified in place)
+            strategy: Imputation strategy
+            group_stats: Group statistics for group-wise
+            grp_cols: Grouping columns
+        
+        Returns:
+            Tuple of (DataFrame, fitted_imputer, imputed_columns)
+        """
         num_cols = list(X.select_dtypes(include=[np.number]).columns)
-        cols_with_missing = [c for c in num_cols if X[c].isna().any()]
+        cols_with_missing = [col for col in num_cols if X[col].isna().any()]
+        
         if not cols_with_missing:
             return X, None, []
-
+        
         X_out = X.copy()
-
-        # KNN na całości numeryków (zabezpieczenie: skalowanie + limit liczby cech)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # KNN Strategy (multivariate with scaling)
+        # ═══════════════════════════════════════════════════════════════
+        
         if strategy == "knn":
-            used_cols = num_cols[: (self.config.knn_max_features or len(num_cols))]
+            # Limit features for performance
+            max_feats = self.config.knn_max_features or len(num_cols)
+            used_cols = num_cols[:max_feats]
+            
+            # Scale → KNN → Inverse scale
+            scaler = StandardScaler()
             imputer = KNNImputer(n_neighbors=self.config.knn_neighbors)
-            scaler = StandardScaler(with_mean=True, with_std=True)
-            mat = X_out[used_cols].to_numpy(dtype=float)
-            # fit-transform scaler → KNN → inverse scale
-            mat_scaled = scaler.fit_transform(mat)
-            filled_scaled = imputer.fit_transform(mat_scaled)
-            filled = scaler.inverse_transform(filled_scaled)
-            X_out.loc[:, used_cols] = filled
-            return X_out, {"imputer": imputer, "scaler": scaler, "columns": used_cols}, cols_with_missing
-
-        # SimpleImputer per kolumna (z opcją grupową)
-        if strategy in {"median", "mean"}:
+            
+            data = X_out[used_cols].values.astype(float)
+            data_scaled = scaler.fit_transform(data)
+            data_imputed_scaled = imputer.fit_transform(data_scaled)
+            data_imputed = scaler.inverse_transform(data_imputed_scaled)
+            
+            X_out[used_cols] = data_imputed
+            
+            return X_out, {
+                "imputer": imputer,
+                "scaler": scaler,
+                "columns": used_cols
+            }, cols_with_missing
+        
+        # ═══════════════════════════════════════════════════════════════
+        # SimpleImputer Strategies
+        # ═══════════════════════════════════════════════════════════════
+        
+        if strategy == "constant":
+            imputer = SimpleImputer(
+                strategy="constant",
+                fill_value=self.config.constant_numeric_fill_value
+            )
+        else:
             imputer = SimpleImputer(strategy=strategy)
-        elif strategy == "constant":
-            imputer = SimpleImputer(strategy="constant", fill_value=self.config.constant_numeric_fill_value)
-        else:  # default median
-            imputer = SimpleImputer(strategy="median")
-
+        
+        # Group-wise imputation
         if group_stats and grp_cols:
-            # uzupełniaj z użyciem statystyk grupowych, a dopiero potem resztę globalnie
-            for c in cols_with_missing:
-                X_out[c] = self._fill_from_groups_numeric(X_out, c, grp_cols, group_stats, fallback=imputer)
+            for col in cols_with_missing:
+                X_out[col] = self._fill_from_groups_numeric(
+                    X_out, col, grp_cols, group_stats, imputer
+                )
+            
             return X_out, imputer, cols_with_missing
-
+        
+        # Standard imputation
         X_out[cols_with_missing] = imputer.fit_transform(X_out[cols_with_missing])
+        
         return X_out, imputer, cols_with_missing
-
+    
     def _fill_from_groups_numeric(
         self,
         X: pd.DataFrame,
@@ -442,253 +975,640 @@ class MissingDataHandler(BaseAgent):
         group_stats: Dict[str, Dict[str, Any]],
         fallback: SimpleImputer
     ) -> pd.Series:
-        s = X[col].copy()
-        mask = s.isna()
+        """Fill using group statistics with global fallback."""
+        series = X[col].copy()
+        mask = series.isna()
+        
         if not mask.any():
-            return s
-
+            return series
+        
+        # Try group stats
         key = tuple(grp_cols)
-        stat = group_stats.get(key, {}).get(col)
-        if stat is not None and isinstance(stat, dict) and stat.get("count", 0) >= self.config.group_min_size:
-            # preferuj medianę grupową
-            val = stat.get("median")
-            s.loc[mask] = val
-            mask = s.isna()
-
-        # fallback globalny
+        stats = group_stats.get(key, {}).get(col)
+        
+        if stats and isinstance(stats, dict):
+            if stats.get("count", 0) >= self.config.group_min_size:
+                fill_value = stats.get("median")
+                series.loc[mask] = fill_value
+                mask = series.isna()
+        
+        # Global fallback
         if mask.any():
-            s.loc[mask] = fallback.fit_transform(s.to_frame())[mask.values, 0]
-        return s
-
-    def _compute_group_stats(self, X: pd.DataFrame, grp_cols: List[str]) -> Dict[str, Dict[str, Any]]:
+            series.loc[mask] = fallback.fit_transform(
+                series.to_frame()
+            )[mask.values, 0]
+        
+        return series
+    
+    def _compute_group_stats(
+        self,
+        X: pd.DataFrame,
+        grp_cols: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
         """
-        Zwraca: { (grp_cols): {col: {median, mean, count}} }
+        Compute group-wise statistics.
+        
+        Returns:
+            Dict mapping (grp_cols) → {col → {median, mean, count}}
         """
         stats: Dict[str, Dict[str, Any]] = {}
-        key = tuple(grp_cols)
+        
         num_cols = list(X.select_dtypes(include=[np.number]).columns)
+        
         if not num_cols or not grp_cols:
             return stats
-        g = X.groupby(grp_cols, dropna=False)
-        med = g[num_cols].median(numeric_only=True)
-        mea = g[num_cols].mean(numeric_only=True)
-        cnt = g[num_cols].count()
-        m: Dict[str, Any] = {}
-        for c in num_cols:
-            m[c] = {
-                "median": med[c],
-                "mean": mea[c],
-                "count": cnt[c]
-            }
-        # przechowuj Series per kolumna (indeks=grupa), wykorzystamy lookup podczas fill
+        
+        grouped = X.groupby(grp_cols, dropna=False)
+        
+        key = tuple(grp_cols)
         stats[key] = {}
-        for c in num_cols:
-            stats[key][c] = {
-                "median": m[c]["median"],
-                "mean": m[c]["mean"],
-                "count": m[c]["count"]
-            }
+        
+        for col in num_cols:
+            try:
+                group_medians = grouped[col].median()
+                group_means = grouped[col].mean()
+                group_counts = grouped[col].count()
+                
+                stats[key][col] = {
+                    "median": group_medians,
+                    "mean": group_means,
+                    "count": group_counts
+                }
+            except Exception:
+                continue
+        
         return stats
-
-    # === IMPUTACJA KATEGORYCZNA ===
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Categorical Imputation
+    # ───────────────────────────────────────────────────────────────────
+    
     def _impute_categorical(
         self,
         X: pd.DataFrame,
         strategy: str,
-        *,
         group_stats: Optional[Dict[str, Dict[str, Any]]] = None,
         grp_cols: Optional[List[str]] = None
     ) -> Tuple[pd.DataFrame, Optional[Any], List[str]]:
+        """
+        Impute categorical columns.
+        
+        Args:
+            X: DataFrame (modified in place)
+            strategy: Imputation strategy
+            group_stats: Group statistics (not used for categorical yet)
+            grp_cols: Grouping columns
+        
+        Returns:
+            Tuple of (DataFrame, fitted_imputer, imputed_columns)
+        """
         cat_cols = list(X.select_dtypes(include=["object", "category"]).columns)
-        cols_with_missing = [c for c in cat_cols if X[c].isna().any()]
+        cols_with_missing = [col for col in cat_cols if X[col].isna().any()]
+        
         if not cols_with_missing:
             return X, None, []
-
+        
         X_out = X.copy()
+        
+        # Drop strategy handled earlier
         if strategy == "drop":
-            # wykonane wcześniej
             return X_out, None, []
-
-        if strategy == "most_frequent":
-            imputer = SimpleImputer(strategy="most_frequent")
-        elif strategy == "constant":
-            imputer = SimpleImputer(strategy="constant", fill_value=self.config.constant_categorical_fill_value)
+        
+        # SimpleImputer
+        if strategy == "constant":
+            imputer = SimpleImputer(
+                strategy="constant",
+                fill_value=self.config.constant_categorical_fill_value
+            )
         else:
             imputer = SimpleImputer(strategy="most_frequent")
-
+        
+        # Group-wise mode (optional)
         if group_stats and grp_cols:
-            # tryb grupowy dla kategorii: najczęstsza wartość w grupie; fallback globalny
-            for c in cols_with_missing:
-                s = X_out[c].copy()
-                mask = s.isna()
-                if not mask.any():
-                    continue
-                # mod w grupie
-                try:
-                    mode_series = X_out.groupby(grp_cols)[c].agg(lambda x: x.mode().iloc[0] if x.mode().size else np.nan)
-                    # przypisz po alignie
-                    fill_vals = X_out[grp_cols].merge(
-                        mode_series.rename("___mode"), left_on=grp_cols, right_index=True, how="left"
-                    )["___mode"].values
-                    s.loc[mask] = pd.Series(fill_vals, index=s.index)[mask]
-                except Exception:
-                    pass
-                mask = s.isna()
+            for col in cols_with_missing:
+                series = X_out[col].copy()
+                mask = series.isna()
+                
                 if mask.any():
-                    s.loc[mask] = imputer.fit_transform(s.to_frame())[mask.values, 0]
-                X_out[c] = s
-            # zachowaj category dtype jeśli było
-            for c in cols_with_missing:
-                if pd.api.types.is_categorical_dtype(X[c]):
-                    X_out[c] = X_out[c].astype("category")
+                    try:
+                        # Group mode
+                        group_modes = X_out.groupby(grp_cols)[col].apply(
+                            lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else np.nan
+                        )
+                        
+                        # Merge and fill
+                        merged = X_out[grp_cols].merge(
+                            group_modes.rename("__mode"),
+                            left_on=grp_cols,
+                            right_index=True,
+                            how="left"
+                        )
+                        
+                        series.loc[mask] = merged.loc[mask, "__mode"].values
+                    except Exception:
+                        pass
+                    
+                    # Global fallback
+                    mask = series.isna()
+                    if mask.any():
+                        series.loc[mask] = imputer.fit_transform(
+                            series.to_frame()
+                        )[mask.values, 0]
+                
+                X_out[col] = series
+            
             return X_out, imputer, cols_with_missing
-
+        
+        # Standard imputation
         X_out[cols_with_missing] = imputer.fit_transform(X_out[cols_with_missing])
-        for c in cols_with_missing:
-            if pd.api.types.is_categorical_dtype(X[c]):
-                X_out[c] = X_out[c].astype("category")
+        
+        # Preserve category dtype
+        for col in cols_with_missing:
+            if pd.api.types.is_categorical_dtype(X[col]):
+                X_out[col] = X_out[col].astype("category")
+        
         return X_out, imputer, cols_with_missing
-
-    # === IMPUTACJA DATETIME ===
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Datetime Imputation
+    # ───────────────────────────────────────────────────────────────────
+    
     def _impute_datetime(
         self,
         X: pd.DataFrame,
         strategy: str,
-        *,
         constant_value: Optional[pd.Timestamp] = None
     ) -> Tuple[pd.DataFrame, Optional[Any], List[str]]:
-        dt_cols = list(X.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns)
-        cols_with_missing = [c for c in dt_cols if X[c].isna().any()]
+        """
+        Impute datetime columns.
+        
+        Args:
+            X: DataFrame (modified in place)
+            strategy: Imputation strategy
+            constant_value: Constant timestamp for constant strategy
+        
+        Returns:
+            Tuple of (DataFrame, imputer_info, imputed_columns)
+        """
+        dt_cols = list(X.select_dtypes(
+            include=["datetime64[ns]", "datetime64[ns, UTC]"]
+        ).columns)
+        cols_with_missing = [col for col in dt_cols if X[col].isna().any()]
+        
         if not cols_with_missing:
             return X, None, []
-
+        
         X_out = X.copy()
-        # Operacje datetime wykonujemy kolumna-po-kolumnie
-        used_strategy = strategy
-        for c in cols_with_missing:
-            s = X_out[c]
-            if used_strategy == "median":
-                # median timestamp: konwertuj na int64 ns → median → z powrotem
-                vals = s.view("int64")
-                med = np.nanmedian(vals.astype("float"))
-                fill = pd.to_datetime(int(med), utc="UTC" in str(s.dtype), unit="ns")
-                X_out[c] = s.fillna(fill)
-            elif used_strategy == "most_frequent":
-                mode = s.mode(dropna=True)
-                fill = mode.iloc[0] if len(mode) else s.dropna().min()
-                X_out[c] = s.fillna(fill)
-            elif used_strategy == "forward_fill":
-                X_out[c] = s.fillna(method="ffill").fillna(method="bfill")
-            elif used_strategy == "backward_fill":
-                X_out[c] = s.fillna(method="bfill").fillna(method="ffill")
-            elif used_strategy == "constant":
-                const = constant_value if isinstance(constant_value, pd.Timestamp) else pd.Timestamp("1970-01-01")
-                X_out[c] = s.fillna(const)
+        
+        for col in cols_with_missing:
+            series = X_out[col]
+            
+            if strategy == "median":
+                # Convert to int64, compute median, convert back
+                values_int = series.view("int64")
+                median_int = np.nanmedian(values_int.astype(float))
+                fill_value = pd.to_datetime(
+                    int(median_int),
+                    unit="ns",
+                    utc="UTC" in str(series.dtype)
+                )
+                X_out[col] = series.fillna(fill_value)
+            
+            elif strategy == "most_frequent":
+                mode = series.mode(dropna=True)
+                fill_value = mode.iloc[0] if len(mode) > 0 else series.dropna().min()
+                X_out[col] = series.fillna(fill_value)
+            
+            elif strategy == "forward_fill":
+                X_out[col] = series.ffill().bfill()
+            
+            elif strategy == "backward_fill":
+                X_out[col] = series.bfill().ffill()
+            
+            elif strategy == "constant":
+                const = constant_value if isinstance(constant_value, pd.Timestamp) else \
+                        pd.Timestamp("1970-01-01")
+                X_out[col] = series.fillna(const)
+            
             else:
-                # domyślnie median
-                vals = s.view("int64")
-                med = np.nanmedian(vals.astype("float"))
-                fill = pd.to_datetime(int(med), utc="UTC" in str(s.dtype), unit="ns")
-                X_out[c] = s.fillna(fill)
-
-        return X_out, {"strategy": used_strategy}, cols_with_missing
-
-    # === STOSOWANIE NA NOWYCH DANYCH ===
+                # Default to median
+                values_int = series.view("int64")
+                median_int = np.nanmedian(values_int.astype(float))
+                fill_value = pd.to_datetime(
+                    int(median_int),
+                    unit="ns",
+                    utc="UTC" in str(series.dtype)
+                )
+                X_out[col] = series.fillna(fill_value)
+        
+        imputer_info = {"strategy": strategy}
+        
+        return X_out, imputer_info, cols_with_missing
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Output Building
+    # ───────────────────────────────────────────────────────────────────
+    
+    def _build_imputation_log(
+        self,
+        cols_to_drop: List[str],
+        rows_dropped_target: int,
+        rows_dropped_cat: int,
+        num_strategy: str,
+        num_cols: List[str],
+        cat_strategy: str,
+        cat_cols: List[str],
+        dt_strategy: str,
+        dt_cols: List[str],
+        ind_num: List[str],
+        ind_cat: List[str],
+        ind_dt: List[str]
+    ) -> List[str]:
+        """Build human-readable imputation log."""
+        log: List[str] = []
+        
+        if cols_to_drop:
+            log.append(f"Dropped {len(cols_to_drop)} columns with extreme missing")
+        
+        if rows_dropped_target:
+            log.append(f"Dropped {rows_dropped_target} rows with missing target")
+        
+        if rows_dropped_cat:
+            log.append(f"Dropped {rows_dropped_cat} rows with missing categorical")
+        
+        if num_cols:
+            log.append(f"Imputed {len(num_cols)} numeric columns ({num_strategy})")
+        
+        if cat_cols:
+            log.append(f"Imputed {len(cat_cols)} categorical columns ({cat_strategy})")
+        
+        if dt_cols:
+            log.append(f"Imputed {len(dt_cols)} datetime columns ({dt_strategy})")
+        
+        if ind_num:
+            log.append(f"Added {len(ind_num)} numeric missing indicators")
+        
+        if ind_cat:
+            log.append(f"Added {len(ind_cat)} categorical missing indicators")
+        
+        if ind_dt:
+            log.append(f"Added {len(ind_dt)} datetime missing indicators")
+        
+        if not log:
+            log.append("No missing data operations required")
+        
+        return log
+    
+    def _build_fitted_dict(
+        self,
+        num_strategy: str,
+        num_imputer: Optional[Any],
+        num_cols: List[str],
+        cat_strategy: str,
+        cat_imputer: Optional[Any],
+        cat_cols: List[str],
+        dt_strategy: str,
+        dt_imputer: Optional[Any],
+        dt_cols: List[str],
+        ind_num: List[str],
+        ind_cat: List[str],
+        ind_dt: List[str],
+        cols_to_drop: List[str],
+        target_column: str
+    ) -> Dict[str, Any]:
+        """Build fitted imputers dictionary."""
+        return {
+            "numeric": {
+                "strategy": num_strategy,
+                "imputer": num_imputer,
+                "columns": num_cols
+            },
+            "categorical": {
+                "strategy": cat_strategy,
+                "imputer": cat_imputer,
+                "columns": cat_cols
+            },
+            "datetime": {
+                "strategy": dt_strategy,
+                "imputer": dt_imputer,
+                "columns": dt_cols,
+                "constant_value": self.config.constant_datetime_fill_value.isoformat()
+                    if isinstance(self.config.constant_datetime_fill_value, pd.Timestamp)
+                    else None
+            },
+            "indicators": {
+                "numeric": ind_num,
+                "categorical": ind_cat,
+                "datetime": ind_dt,
+                "suffix": self.config.indicator_suffix
+            },
+            "dropped_columns": {
+                "threshold": self.config.drop_column_missing_pct_threshold,
+                "columns": cols_to_drop
+            },
+            "target_column": target_column,
+            "preserve_column_order": self.config.preserve_column_order
+        }
+    
+    # ───────────────────────────────────────────────────────────────────
+    # Apply to New Data (Static Method)
+    # ───────────────────────────────────────────────────────────────────
+    
     @staticmethod
     def apply_to_new(
         new_data: pd.DataFrame,
         fitted: Dict[str, Any]
     ) -> pd.DataFrame:
         """
-        Deterministycznie stosuje te same operacje imputacji na nowych danych.
-
-        Zasady:
-        - Dodaje WSZYSTKIE kolumny wymagane przez imputery (jeśli brakuje → NaN).
-        - Odtwarza wskaźniki braków, jeśli były tworzone.
-        - Przywraca oryginalny porządek kolumn, jeśli tak skonfigurowano (nowe wskaźniki na końcu).
+        🎯 **Apply Fitted Imputers to New Data**
+        
+        Deterministically applies same transformations to new data.
+        
+        Args:
+            new_data: New DataFrame to impute
+            fitted: Fitted imputers from execute()
+        
+        Returns:
+            Imputed DataFrame
+        
+        Example:
+```python
+            # Train
+            handler = MissingDataHandler()
+            result = handler.execute(train_df, 'target')
+            fitted = result.data['fitted']
+            
+            # Test
+            test_imputed = MissingDataHandler.apply_to_new(test_df, fitted)
+```
         """
         df = new_data.copy()
         original_order = list(df.columns)
-
-        # Przygotuj wymagane kolumny
-        num_cols = fitted.get("numeric", {}).get("columns", []) or []
-        cat_cols = fitted.get("categorical", {}).get("columns", []) or []
-        dt_cols  = fitted.get("datetime", {}).get("columns", []) or []
-
-        for c in num_cols + cat_cols + dt_cols:
-            if c not in df.columns:
-                df[c] = np.nan
-
-        # Wskaźniki
-        ind = fitted.get("indicators", {}) or {}
-        suffix = ind.get("suffix", "__ismissing")
-        for name in ind.get("numeric", []) or []:
-            base = name.removesuffix(suffix) if hasattr(str, "removesuffix") else name.replace(suffix, "")
-            if base in df.columns:
-                df[name] = df[base].isna().astype("Int8")
-        for name in ind.get("categorical", []) or []:
-            base = name.removesuffix(suffix) if hasattr(str, "removesuffix") else name.replace(suffix, "")
-            if base in df.columns:
-                df[name] = df[base].isna().astype("Int8")
-        for name in ind.get("datetime", []) or []:
-            base = name.removesuffix(suffix) if hasattr(str, "removesuffix") else name.replace(suffix, "")
-            if base in df.columns:
-                df[name] = df[base].isna().astype("Int8")
-
-        # NUMERIC
+        
+        # Extract fitted components
         num_pack = fitted.get("numeric", {})
-        num_imputer = num_pack.get("imputer", None)
-        if num_imputer is not None and num_cols:
-            # KNN variant?
-            if isinstance(num_imputer, dict) and {"imputer", "scaler", "columns"} <= set(num_imputer.keys()):
+        cat_pack = fitted.get("categorical", {})
+        dt_pack = fitted.get("datetime", {})
+        ind_pack = fitted.get("indicators", {})
+        
+        num_cols = num_pack.get("columns", []) or []
+        cat_cols = cat_pack.get("columns", []) or []
+        dt_cols = dt_pack.get("columns", []) or []
+        
+        # Ensure required columns exist
+        for col in num_cols + cat_cols + dt_cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        
+        # ═══════════════════════════════════════════════════════════════
+        # Missing Indicators
+        # ═══════════════════════════════════════════════════════════════
+        
+        suffix = ind_pack.get("suffix", "__ismissing")
+        
+        for indicator in ind_pack.get("numeric", []) or []:
+            base_col = indicator.replace(suffix, "")
+            if base_col in df.columns:
+                df[indicator] = df[base_col].isna().astype("Int8")
+        
+        for indicator in ind_pack.get("categorical", []) or []:
+            base_col = indicator.replace(suffix, "")
+            if base_col in df.columns:
+                df[indicator] = df[base_col].isna().astype("Int8")
+        
+        for indicator in ind_pack.get("datetime", []) or []:
+            base_col = indicator.replace(suffix, "")
+            if base_col in df.columns:
+                df[indicator] = df[base_col].isna().astype("Int8")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # Numeric Imputation
+        # ═══════════════════════════════════════════════════════════════
+        
+        num_imputer = num_pack.get("imputer")
+        
+        if num_imputer and num_cols:
+            # KNN variant
+            if isinstance(num_imputer, dict) and "scaler" in num_imputer:
                 used_cols = num_imputer["columns"]
                 scaler = num_imputer["scaler"]
-                imp = num_imputer["imputer"]
-                mat = df[used_cols].to_numpy(dtype=float)
-                mat_scaled = scaler.transform(mat)
-                filled_scaled = imp.transform(mat_scaled)
-                filled = scaler.inverse_transform(filled_scaled)
-                df.loc[:, used_cols] = filled
+                imputer = num_imputer["imputer"]
+                
+                data = df[used_cols].values.astype(float)
+                data_scaled = scaler.transform(data)
+                data_imputed_scaled = imputer.transform(data_scaled)
+                data_imputed = scaler.inverse_transform(data_imputed_scaled)
+                
+                df[used_cols] = data_imputed
+            
+            # SimpleImputer
             else:
-                df.loc[:, num_cols] = num_imputer.transform(df[num_cols])
-
-        # CATEGORICAL
-        cat_imputer = fitted.get("categorical", {}).get("imputer", None)
-        if cat_imputer is not None and cat_cols:
-            df.loc[:, cat_cols] = cat_imputer.transform(df[cat_cols])
-
-        # DATETIME
-        dt_pack = fitted.get("datetime", {}) or {}
+                df[num_cols] = num_imputer.transform(df[num_cols])
+        
+        # ═══════════════════════════════════════════════════════════════
+        # Categorical Imputation
+        # ═══════════════════════════════════════════════════════════════
+        
+        cat_imputer = cat_pack.get("imputer")
+        
+        if cat_imputer and cat_cols:
+            df[cat_cols] = cat_imputer.transform(df[cat_cols])
+        
+        # ═══════════════════════════════════════════════════════════════
+        # Datetime Imputation
+        # ═══════════════════════════════════════════════════════════════
+        
         dt_strategy = dt_pack.get("strategy", "median")
+        
         if dt_cols:
-            for c in dt_cols:
-                s = df[c]
-                if not pd.api.types.is_datetime64_any_dtype(s):
-                    with pd.option_context("mode.use_inf_as_na", True):
-                        df[c] = pd.to_datetime(s, errors="coerce")
-                s = df[c]
-                if s.isna().any():
-                    if dt_strategy == "most_frequent":
-                        mode = s.mode(dropna=True)
-                        fill = mode.iloc[0] if len(mode) else s.dropna().min()
-                        df[c] = s.fillna(fill)
+            for col in dt_cols:
+                # Ensure datetime type
+                if not pd.api.types.is_datetime64_any_dtype(df[col]):
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                
+                series = df[col]
+                
+                if series.isna().any():
+                    if dt_strategy == "median":
+                        values_int = series.view("int64")
+                        median_int = np.nanmedian(values_int.astype(float))
+                        fill_value = pd.to_datetime(
+                            int(median_int),
+                            unit="ns",
+                            utc="UTC" in str(series.dtype)
+                        )
+                        df[col] = series.fillna(fill_value)
+                    
+                    elif dt_strategy == "most_frequent":
+                        mode = series.mode(dropna=True)
+                        fill_value = mode.iloc[0] if len(mode) > 0 else series.dropna().min()
+                        df[col] = series.fillna(fill_value)
+                    
                     elif dt_strategy == "forward_fill":
-                        df[c] = s.fillna(method="ffill").fillna(method="bfill")
+                        df[col] = series.ffill().bfill()
+                    
                     elif dt_strategy == "backward_fill":
-                        df[c] = s.fillna(method="bfill").fillna(method="ffill")
+                        df[col] = series.bfill().ffill()
+                    
                     elif dt_strategy == "constant":
-                        const_iso = dt_pack.get("constant_value", None)
+                        const_iso = dt_pack.get("constant_value")
                         const = pd.Timestamp(const_iso) if const_iso else pd.Timestamp("1970-01-01")
-                        df[c] = s.fillna(const)
-                    else:
-                        vals = s.view("int64")
-                        med = np.nanmedian(vals.astype("float"))
-                        fill = pd.to_datetime(int(med), utc="UTC" in str(s.dtype), unit="ns")
-                        df[c] = s.fillna(fill)
-
-        # Kolejność kolumn
+                        df[col] = series.fillna(const)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # Preserve Column Order
+        # ═══════════════════════════════════════════════════════════════
+        
         if fitted.get("preserve_column_order", False):
-            new_cols = [c for c in original_order if c in df.columns] + [c for c in df.columns if c not in original_order]
+            new_cols = [c for c in original_order if c in df.columns] + \
+                      [c for c in df.columns if c not in original_order]
             df = df[new_cols]
-
+        
         return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION: Convenience Functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def impute_missing(
+    data: pd.DataFrame,
+    target_column: str,
+    config: Optional[MissingHandlerConfig] = None
+) -> pd.DataFrame:
+    """
+    🚀 **Convenience Function: Impute Missing**
+    
+    Quick missing data imputation with automatic configuration.
+    
+    Args:
+        data: Input DataFrame
+        target_column: Target column name
+        config: Optional custom configuration
+    
+    Returns:
+        Imputed DataFrame
+    
+    Example:
+```python
+        from agents.preprocessing import impute_missing
+        
+        df_imputed = impute_missing(train_df, 'target')
+```
+    """
+    handler = MissingDataHandler(config)
+    result = handler.execute(data=data, target_column=target_column)
+    
+    if not result.is_success():
+        raise RuntimeError(f"Imputation failed: {result.errors}")
+    
+    return result.data["data"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION: Module Initialization
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _module_init():
+    """Initialize module on import."""
+    logger.info(f"✓ MissingDataHandler v{__version__} loaded")
+
+_module_init()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION: Module Self-Test
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    print(f"{'='*80}")
+    print(f"MissingDataHandler v{__version__}")
+    print(f"{'='*80}")
+    
+    # Generate synthetic data with missing values
+    np.random.seed(42)
+    
+    df = pd.DataFrame({
+        'num_1': np.random.randn(1000),
+        'num_2': np.random.rand(1000) * 100,
+        'cat_1': np.random.choice(['A', 'B', 'C'], 1000),
+        'cat_2': np.random.choice(['X', 'Y', 'Z'], 1000),
+        'date_1': pd.date_range('2024-01-01', periods=1000, freq='H'),
+        'target': np.random.choice([0, 1], 1000)
+    })
+    
+    # Add missing values
+    df.loc[np.random.choice(df.index, 100), 'num_1'] = np.nan
+    df.loc[np.random.choice(df.index, 50), 'cat_1'] = np.nan
+    df.loc[np.random.choice(df.index, 30), 'date_1'] = pd.NaT
+    
+    print("\n✓ Testing missing data handling...")
+    print(f"  Missing before: num_1={df['num_1'].isna().sum()}, "
+          f"cat_1={df['cat_1'].isna().sum()}, "
+          f"date_1={df['date_1'].isna().sum()}")
+    
+    handler = MissingDataHandler()
+    result = handler.execute(
+        data=df,
+        target_column='target'
+    )
+    
+    if result.is_success():
+        print(f"\n✓ Imputation completed successfully")
+        
+        df_imputed = result.data['data']
+        dropped = result.data['dropped']
+        telemetry = result.data['telemetry']
+        
+        print(f"\nSummary:")
+        print(f"  Shape: {result.data['shapes']['original']} → {result.data['shapes']['final']}")
+        print(f"  Dropped columns: {dropped['columns']}")
+        print(f"  Dropped rows (target): {dropped['rows_target']}")
+        print(f"  Dropped rows (categorical): {dropped['rows_categorical']}")
+        
+        print(f"\nTelemetry:")
+        for key, value in telemetry['counts'].items():
+            print(f"  {key}: {value}")
+        
+        print(f"\nImputation Log:")
+        for log_entry in result.data['imputation_log']:
+            print(f"  • {log_entry}")
+    
+    else:
+        print(f"\n✗ Imputation failed:")
+        for error in result.errors:
+            print(f"  - {error}")
+    
+    print(f"\n{'='*80}")
+    print("USAGE EXAMPLES:")
+    print(f"{'='*80}")
+    print("""
+from agents.preprocessing import MissingDataHandler, MissingHandlerConfig
+
+# Basic usage
+handler = MissingDataHandler()
+
+result = handler.execute(
+    data=train_df,
+    target_column='target'
+)
+
+df_imputed = result.data['data']
+fitted = result.data['fitted']
+
+# Apply to new data
+test_imputed = MissingDataHandler.apply_to_new(test_df, fitted)
+
+# Custom configuration
+config = MissingHandlerConfig(
+    strategy_numeric='knn',
+    add_numeric_missing_indicators=True,
+    enable_groupwise_imputation=True
+)
+
+handler = MissingDataHandler(config)
+
+# Convenience function
+from agents.preprocessing import impute_missing
+
+df_imputed = impute_missing
